@@ -31,6 +31,7 @@ import hashlib
 import secrets
 import getpass
 import argparse
+import shlex
 import subprocess
 import tempfile
 import datetime
@@ -236,12 +237,21 @@ def to_bech32(hrp: str, raw: bytes) -> str:
 
 def from_bech32(expected_hrp: str, s: str) -> bytes:
     pos = s.rfind("1")
+    if pos < 1:
+        raise ValueError("not a bech32 string (no separator)")
     hrp = s[:pos]
     if hrp != expected_hrp:
         raise ValueError(f"expected {expected_hrp}, got {hrp}")
     data = [CHARSET.find(c) for c in s[pos + 1 :]]
     if any(d == -1 for d in data):
         raise ValueError("invalid bech32 char")
+    if len(data) < 6:
+        raise ValueError("bech32 string too short")
+    # Verify the checksum. Without this a typo'd key decodes silently to a
+    # *different* valid-looking key, and the failure only surfaces later as a
+    # confusing auth rejection from the relay.
+    if bech32_polymod(bech32_hrp_expand(hrp) + data) != 1:
+        raise ValueError("bad bech32 checksum (typo in the key?)")
     decoded = convertbits(data[:-6], 5, 8, False)
     return bytes(decoded)
 
@@ -584,10 +594,12 @@ def cmd_provision(args):
         prof += ["--nip05", args.nip05]
     buzz(prof, child_env, capture=False)
 
+    # Never echo the nsec — it would land in terminal scrollback and CI logs,
+    # defeating the 0600 file it was just written to.
     sys.stderr.write(
         f"\n>> done. agent identity saved at: {out_path} (mode 0600)\n"
         f"   npub: {agent_npub}\n"
-        f"   verify: BUZZ_PRIVATE_KEY={agent_nsec} "
+        f"   verify: set -a; source {out_path}; set +a; "
         f"{os.environ.get('BUZZ_BIN', 'buzz')} users get\n"
     )
 
@@ -598,9 +610,14 @@ def write_env_file(out_path, name, relay, agent_nsec, auth_tag, agent_npub, agen
         f'# Buzz agent identity for "{name}" — generated {ts}\n'
         f"# Source this where the agent runs:  set -a; source {out_path}; set +a\n"
         f"# CONTAINS A SECRET (nsec). Do not commit.\n"
-        f"BUZZ_RELAY_URL={relay}\n"
-        f"BUZZ_PRIVATE_KEY={agent_nsec}\n"
-        f"BUZZ_AUTH_TAG={auth_tag}\n"
+        # Shell-quoted: the auth tag is a JSON array containing spaces, so an
+        # unquoted value makes `source` parse the line as a command with an
+        # assignment prefix — the variable ends up unset and the rest of the
+        # line runs as a command. shlex.quote rather than hardcoded quotes
+        # because the tag embeds the user-supplied --conditions string.
+        f"BUZZ_RELAY_URL={shlex.quote(relay)}\n"
+        f"BUZZ_PRIVATE_KEY={shlex.quote(agent_nsec)}\n"
+        f"BUZZ_AUTH_TAG={shlex.quote(auth_tag)}\n"
         f"# npub (public):  {agent_npub}\n"
         f"# pubkey hex:     {agent_hex}\n"
     )
@@ -633,7 +650,7 @@ def build_parser():
     r.add_argument("--name", required=True, help="display name")
     r.add_argument("--about", default="", help="bio / about text")
     r.add_argument("--avatar", default="", help="path to a static PNG/JPEG/WebP")
-    r.add_argument("--nip05", default="", help="NIP-05 id, e.g. dev@lucian.earth")
+    r.add_argument("--nip05", default="", help="NIP-05 id, e.g. agent@example.com")
     r.add_argument(
         "--conditions",
         default="",
