@@ -168,6 +168,33 @@ GIT_CONFIG_KEY_1=credential.useHttpPath GIT_CONFIG_VALUE_1=true \
 A username prompt means one of the three above is missing — the helper cannot prompt, so any
 failure to engage looks like ordinary HTTP basic auth. Check them in order.
 
+#### Symptom → cause
+
+All four seen in practice against a live relay:
+
+| Symptom | Cause |
+|---|---|
+| prompts for a username | the helper isn't engaging: git < 2.46, not on `PATH`, or `credential.helper` unset. It cannot prompt, so any non-engagement looks like ordinary basic auth |
+| `403 restricted: not a relay member` | the key isn't a relay member and no `BUZZ_AUTH_TAG` was presented. Channel membership does **not** satisfy this — separate gate, checked first |
+| `404 repository not found` | no `buzz-channel` tag on the announcement, or the caller isn't an active member of the bound channel |
+| `401` + `send-pack: unexpected disconnect` + a trailing `Everything up-to-date` | the pack exceeds `http.postBuffer`. **Not** credentials — the same key succeeds on a smaller push |
+
+The recommended invocation covers all of them. The empty `credential.helper=` matters because the
+setting is additive: without the reset, a globally configured helper (macOS keychain, cache) is
+consulted first and can answer with a username/password that the relay rejects — and a caching
+helper will also try to store the time-bound NIP-98 token, which is useless a minute later.
+
+```sh
+git -c credential.helper= \
+    -c credential.helper=nostr \
+    -c credential.useHttpPath=true \
+    -c http.postBuffer=524288000 \
+    push buzz main
+```
+
+`git ls-remote <url>` is the cheap probe — it exercises auth without transferring anything, and
+exit 0 with zero refs means live-and-empty rather than broken.
+
 #### Two independent gates
 
 `403 restricted: not a relay member` is a *different* failure — it means the helper worked and
