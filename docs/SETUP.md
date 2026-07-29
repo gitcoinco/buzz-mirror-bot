@@ -162,6 +162,32 @@ GIT_CONFIG_KEY_1=credential.useHttpPath GIT_CONFIG_VALUE_1=true \
 A username prompt means one of the three above is missing — the helper cannot prompt, so any
 failure to engage looks like ordinary HTTP basic auth. Check them in order.
 
+#### Two independent gates
+
+`403 restricted: not a relay member` is a *different* failure — it means the helper worked and
+the relay rejected the identity. Buzz checks two separate things, in this order:
+
+1. **Relay membership** (`relay_members` table). Either the key is an accepted member itself, or
+   it presents a NIP-OA auth tag whose *owner* is a member.
+2. **Channel membership** of the repo's bound channel.
+
+Adding a key to a channel does **not** make it a relay member — different tables, different
+gates. A provisioned agent identity is normally not a relay member in its own right, so its auth
+tag is load-bearing on **every** request, not a one-time enrolment: the relay records the
+agent→owner mapping in `users`, but never adds the agent to `relay_members`.
+
+So an agent key needs both env vars, and the tag contains spaces — quote it or the shell eats it:
+
+```sh
+export NOSTR_PRIVATE_KEY='nsec1…'
+export BUZZ_AUTH_TAG='["auth", "<owner-hex>", "", "<sig>"]'   # single quotes required
+```
+
+Equivalently, `git clone --config nostr.authtag='["auth", …]'`.
+
+For a one-off human clone it is simpler to use your own key, which is usually a relay member
+directly and needs no tag at all.
+
 ### 5. Fill in the workflow
 
 Edit the two `env:` values at the top — `BUZZ_REPO_URL` (owner is the 64-char hex pubkey that
