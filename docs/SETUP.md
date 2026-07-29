@@ -98,9 +98,12 @@ NOSTR_PRIVATE_KEY=<your-nsec> git push buzz refs/heads/main:refs/heads/main
 **Repo was born on Buzz** (like this one) — push it down to GitHub once. Create the GitHub repo
 empty, with no README and no initial commit, then:
 
+Reading from Buzz needs the credential helper registered first — see
+[Cloning from Buzz](#cloning-from-buzz) below, and do that before the clone.
+
 ```sh
-NOSTR_PRIVATE_KEY=<your-nsec> \
-  git clone https://buzz.gitcoin.co/git/<owner-hex>/<repo>.git && cd <repo>
+export NOSTR_PRIVATE_KEY=<your-nsec>
+git clone https://buzz.gitcoin.co/git/<owner-hex>/<repo>.git && cd <repo>
 git remote add gh git@github.com:<org>/<repo>.git
 git push gh main
 ```
@@ -109,9 +112,35 @@ That single push is the whole bootstrap: it creates `main` on GitHub *and* lands
 file on the default branch, at which point the Action appears in the UI and takes over. Every
 later sync is automatic.
 
-This step needs `git-credential-nostr` on your machine, since it reads from Buzz. If you'd rather
-not install it, have someone who already has Buzz access hand you a `git bundle` of the repo —
-`git clone <bundle> <repo>` gives you a normal checkout with full history to push to GitHub.
+If you'd rather not install the helper, have someone who already has Buzz access hand you a
+`git bundle` of the repo — `git clone <bundle> <repo>` gives you a normal checkout with full
+history to push to GitHub.
+
+#### Cloning from Buzz
+
+Buzz git authenticates with a nostr key over NIP-98, not a password. Three things must all be
+true or git silently falls back to prompting for a username and password, which will never work:
+
+```sh
+# 1. git >= 2.46. Older git never sends the credential protocol's
+#    capability[]=authtype line, so the helper returns nothing and git prompts.
+#    macOS Xcode command-line-tools git is often too old; `brew install git` is current.
+git --version
+
+# 2. The helper is built and on PATH as `git-credential-nostr`.
+cargo install --git https://github.com/block/buzz git-credential-nostr --locked
+command -v git-credential-nostr
+
+# 3. git is told to use it, with per-path credentials.
+git config --global credential.helper nostr
+git config --global credential.useHttpPath true
+```
+
+Then `export NOSTR_PRIVATE_KEY=<nsec>` (or `git config --global nostr.keyfile ~/.nostr/key` with
+a 0600 file) and clone normally.
+
+A username prompt means one of the three above is missing — the helper cannot prompt, so any
+failure to engage looks like ordinary HTTP basic auth. Check them in order.
 
 ### 5. Fill in the workflow
 
