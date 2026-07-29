@@ -77,9 +77,17 @@ buzz repos protect list --id <repo>
 Rule vocabulary: `["buzz-protect", "<ref-pattern>", "<rule>", …]` where rule is
 `push:<owner|admin|member>`, `no-force-push`, `no-delete`, or `require-patch`.
 
-### 4. Seed the Buzz repo from GitHub
+### 4. Get the two histories connected — once, by hand
 
-One-time, done by a human who already holds GitHub read access — no agent involved:
+**The mirror cannot bootstrap itself.** GitHub only exposes a workflow — both its
+`workflow_dispatch` "Run workflow" button and its `schedule` triggers — once the file exists on
+the repo's **default branch**. An empty GitHub repo therefore has no workflow to run, and no way
+to run one. Something has to put the first commit there by hand.
+
+Which direction depends on where the repo started.
+
+**Repo already exists on GitHub** — push it up to Buzz. Done by a human who already holds GitHub
+read access; no agent involved:
 
 ```sh
 git clone git@github.com:<org>/<repo>.git && cd <repo>
@@ -87,11 +95,33 @@ git remote add buzz https://buzz.gitcoin.co/git/<owner-hex>/<repo>.git
 NOSTR_PRIVATE_KEY=<your-nsec> git push buzz refs/heads/main:refs/heads/main
 ```
 
+**Repo was born on Buzz** (like this one) — push it down to GitHub once. Create the GitHub repo
+empty, with no README and no initial commit, then:
+
+```sh
+NOSTR_PRIVATE_KEY=<your-nsec> \
+  git clone https://buzz.gitcoin.co/git/<owner-hex>/<repo>.git && cd <repo>
+git remote add gh git@github.com:<org>/<repo>.git
+git push gh main
+```
+
+That single push is the whole bootstrap: it creates `main` on GitHub *and* lands the workflow
+file on the default branch, at which point the Action appears in the UI and takes over. Every
+later sync is automatic.
+
+This step needs `git-credential-nostr` on your machine, since it reads from Buzz. If you'd rather
+not install it, have someone who already has Buzz access hand you a `git bundle` of the repo —
+`git clone <bundle> <repo>` gives you a normal checkout with full history to push to GitHub.
+
 ### 5. Fill in the workflow
 
 Edit the two `env:` values at the top — `BUZZ_REPO_URL` (owner is the 64-char hex pubkey that
-announced the repo, not a username) and `BUZZ_COMMIT` (pin for the credential-helper build).
-Then run it once via **Actions → Mirror main from Buzz → Run workflow**.
+announced the repo, not a username) and `BUZZ_COMMIT` (pin for the credential-helper build). If
+you bootstrapped from Buzz these are already correct.
+
+After the bootstrap push, confirm it works end to end via **Actions → Mirror main from Buzz →
+Run workflow**. It should report `already in sync` — that is the success case, and it proves
+mirror-bot can authenticate and read before you depend on the schedule.
 
 ## How it behaves
 
