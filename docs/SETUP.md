@@ -95,6 +95,12 @@ git remote add buzz https://buzz.gitcoin.co/git/<owner-hex>/<repo>.git
 NOSTR_PRIVATE_KEY=<your-nsec> git push buzz refs/heads/main:refs/heads/main
 ```
 
+**Any push to Buzz larger than 1 MB needs `-c http.postBuffer=524288000`.** Above git's default
+`http.postBuffer`, the POST switches to chunked transfer encoding and the relay answers `HTTP 401`
+— with a misleading trailing `Everything up-to-date`. It is not a credentials problem: the same
+key succeeds on a smaller push and fails in about two seconds on a larger one.
+
+
 **Repo was born on Buzz** (like this one) — push it down to GitHub once. Create the GitHub repo
 empty, with no README and no initial commit, then:
 
