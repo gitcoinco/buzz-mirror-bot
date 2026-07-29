@@ -132,12 +132,32 @@ cargo install --git https://github.com/block/buzz git-credential-nostr --locked
 command -v git-credential-nostr
 
 # 3. git is told to use it, with per-path credentials.
+#    useHttpPath matters: the NIP-98 token is scoped to the repo path, not the host.
 git config --global credential.helper nostr
 git config --global credential.useHttpPath true
 ```
 
 Then `export NOSTR_PRIVATE_KEY=<nsec>` (or `git config --global nostr.keyfile ~/.nostr/key` with
 a 0600 file) and clone normally.
+
+**Without touching global config.** Pass the settings to the one command instead. A helper value
+containing `/` is run as a path; one without is looked up as `git-credential-nostr` on `PATH`.
+
+```sh
+# Scoped to the new clone — written to its .git/config, so later fetches keep working.
+git clone --config credential.helper=nostr \
+          --config credential.useHttpPath=true \
+          https://<relay-host>/git/<owner-hex>/<repo>.git
+
+# Or fully transient: applies to this invocation only, persists nowhere.
+git -c credential.helper=nostr -c credential.useHttpPath=true clone <url>
+
+# Or with no flags at all, e.g. inside a script.
+GIT_CONFIG_COUNT=2 \
+GIT_CONFIG_KEY_0=credential.helper   GIT_CONFIG_VALUE_0=nostr \
+GIT_CONFIG_KEY_1=credential.useHttpPath GIT_CONFIG_VALUE_1=true \
+  git clone <url>
+```
 
 A username prompt means one of the three above is missing — the helper cannot prompt, so any
 failure to engage looks like ordinary HTTP basic auth. Check them in order.
