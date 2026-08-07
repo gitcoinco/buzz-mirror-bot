@@ -26,12 +26,17 @@ Halts are **sticky**: one message per halt, not one per tick, and the halt holds
 until the two tips converge. A halt freezes deploys for that repo, so the
 message says so.
 
-Liveness: a `last-success` file is touched after every fully successful tick.
-`healthcheck.sh` reads it - used both as the container healthcheck (Coolify
-restarts a wedged-but-running daemon) and as a Coolify scheduled task (Coolify
-notifies out-of-band on Scheduled Task Failure). The daemon deliberately does
-not alert on its own death: an alert that shares a process with the thing it
-watches is not an alert.
+Every tick is self-contained - state lives in state.json and the bare clones on
+the volume, never in memory - so this runs either as a **Coolify scheduled task**
+(`--once`, preferred) or as a long-running loop. Prefer `--once`: the run's own
+exit status is the alert, and Coolify's Scheduled Task Failure notification fires
+on it directly. No last-success file, no staleness probe, no healthcheck, no
+second task watching the first.
+
+The loop mode exists for when no scheduler is available. It needs more: a
+`last-success` file, `healthcheck.sh`, and a separate staleness task - because a
+wedged long-running process never exits to be noticed, and an alert that shares
+a process with the thing it watches is not an alert.
 
 Why polling and not the kind:30618 ref-state subscription: the relay does emit a
 ref-state event on every push, and subscribing would cut latency from ~60s to
@@ -373,17 +378,42 @@ def tick():
             halt(state, repo_id, reason, f"```\n{msg[:800]}\n```")
     if ok:
         touch_last_success()
+    return ok
 
 
 def main():
+    """Two run modes, because nothing here needs a process to stay alive.
+
+    Every tick is self-contained: state lives in state.json and the bare clones
+    on the volume, never in memory. So the loop is genuinely just a scheduler,
+    and if the platform already has one, it should own the schedule instead.
+
+      --once   run a single reconcile and exit non-zero if anything failed.
+               Meant for a Coolify scheduled task, where the *failure itself*
+               is the alert - no last-success file, no staleness probe, no
+               healthcheck, no second task watching the first.
+
+      (default) loop forever. For when a scheduler is not available, or when a
+               sub-minute interval is wanted. Liveness then needs the
+               healthcheck + a separate staleness task, because a wedged
+               long-running process never exits to be noticed.
+
+    Prefer --once. It is strictly less machinery for the same behaviour.
+    """
     os.makedirs(STATE_DIR, exist_ok=True)
-    log(f"starting; repos={list(REPOS)} interval={INTERVAL}s")
+
+    if "--once" in sys.argv:
+        ok = tick()
+        log("ok" if ok else "one or more repos halted")
+        return 0 if ok else 1
+
+    log(f"starting loop; repos={list(REPOS)} interval={INTERVAL}s")
     while True:
         try:
             tick()
         except Exception as e:
-            # Never die on a transient: the restart would lose nothing but the
-            # healthcheck is what should decide we are unhealthy, not a traceback.
+            # Never die on a transient: the healthcheck decides we are
+            # unhealthy, not a traceback on one bad fetch.
             log(f"ERROR tick failed: {e}")
         time.sleep(INTERVAL)
 

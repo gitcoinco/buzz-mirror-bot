@@ -62,18 +62,33 @@ on fetch and looks exactly like a GitHub outage. Naming the subsystem is the ent
 Halt messages also say **"deploys for this repo are frozen"**, because Coolify deploys from
 GitHub. A halted mirror is not cosmetic — Buzz-side work stops reaching production.
 
-## Liveness
+## Run it as a scheduled task, not a long-running process
 
-The daemon writes `last-success` after every fully successful tick. `mirror/healthcheck.sh` reads
-it and exits non-zero when it is stale. That one script is used twice:
+Every tick is self-contained: state lives in `state.json` and the bare clones on the volume,
+never in memory. So the loop is *only* a scheduler, and if the platform already has one it should
+own the schedule instead.
 
-1. **Container `HEALTHCHECK`** → Coolify restarts a wedged-but-running daemon. This is the case a
-   restart policy alone misses: a daemon stuck in a halt or failing to authenticate never crashes.
-2. **Coolify scheduled task** → Coolify fires a **Scheduled Task Failure** notification.
+```sh
+python3 mirror/daemon.py --once     # one reconcile, exit non-zero if anything failed
+```
 
-(2) is the one that matters, because it is the only alert that does not share a failure domain
-with the daemon. An alert posted by the daemon over Buzz dies at exactly the moment its Buzz
-identity is revoked — which is the wedge it most needs to report.
+Run that as a **Coolify scheduled task**. The run's own exit status is the alert, and Coolify's
+**Scheduled Task Failure** notification fires on it directly — email / Slack / Discord / Telegram
+/ Pushover / webhook, out-of-band from Buzz and from the daemon's own identity.
+
+That deletes a whole layer: no `last-success` file, no staleness probe, no container healthcheck,
+no second scheduled task watching the first. One thing runs, and when it fails you are told.
+
+### Liveness
+
+Falls out of the above. A failed run notifies. A run that never happens is Coolify's scheduler
+being down, which is the same failure as the host being down.
+
+The **loop mode** (no `--once`) exists for when no scheduler is available or a sub-minute interval
+is wanted. It costs more: `last-success` + `mirror/healthcheck.sh` as a container `HEALTHCHECK`
+so Coolify restarts a wedged-but-running process, plus a separate scheduled staleness check for
+the alert. A wedged long-running process never exits to be noticed, and an alert that shares a
+process with the thing it watches is not an alert.
 
 > **Verify the notification fires.** There are open Coolify reports of failure notifications not
 > being sent while success notifications are. Test it once with a deliberate failure. An alarm you

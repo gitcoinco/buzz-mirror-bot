@@ -8,6 +8,12 @@
 # Adding a repo to the mirror = one entry in MIRROR_REPOS + installing the
 # GitHub App on that repo. Nothing is added to the mirrored repo itself.
 
+# Preferred deployment is a Coolify **scheduled task** running:
+#     /app/mirror/entrypoint.sh --once
+# The run's exit status is then the alert (Scheduled Task Failure), and none of
+# the healthcheck/staleness machinery is needed. This compose file describes the
+# loop mode, for when no scheduler is available.
+
 services:
   mirror:
     build: .

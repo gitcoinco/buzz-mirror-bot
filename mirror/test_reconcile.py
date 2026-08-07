@@ -201,6 +201,28 @@ check("last-success NOT touched while a repo is halted", "_touched" not in saved
 check("halt message names the account to install on",
       any("nope-org" in p for p in POSTS))
 
+
+# ---------------------------------------------------------------------------
+# --once exit status: for a scheduled task, the exit code IS the alert
+# ---------------------------------------------------------------------------
+
+print("\n--- --once exit status")
+
+daemon.REPOS = {"good": "irlfund/regenOS"}
+daemon.reconcile = lambda repo_id, gh, tok, st: None
+daemon.load_state = lambda: {}
+daemon.save_state = lambda s: None
+touched = []
+daemon.touch_last_success = lambda: touched.append(1)
+sys.argv = ["daemon.py", "--once"]
+check("clean run exits 0", daemon.main() == 0)
+check("clean run recorded success", len(touched) == 1)
+
+daemon.REPOS = {"bad": "nope-org/thing"}
+POSTS.clear(); touched.clear()
+check("failed run exits non-zero", daemon.main() == 1)
+check("failed run did NOT record success", touched == [])
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nFAILED" if FAILED else "\nall passed")
 sys.exit(1 if FAILED else 0)

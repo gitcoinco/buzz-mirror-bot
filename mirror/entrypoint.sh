@@ -58,4 +58,6 @@ if [ -n "${BUZZ_PRIVATE_KEY:-}" ] && [ -z "${NOSTR_PRIVATE_KEY:-}" ]; then
     export NOSTR_PRIVATE_KEY
 fi
 
-exec python3 /app/mirror/daemon.py
+# "$@" so the same image serves both modes: no args loops, `--once` runs a
+# single reconcile and exits non-zero on failure (for a scheduled task).
+exec python3 /app/mirror/daemon.py "$@"
