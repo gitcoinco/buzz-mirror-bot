@@ -1,0 +1,56 @@
+# Coolify application definition for the mirror daemon.
+#
+# Create this once in Coolify, then `tofu import` it into
+# agentic-engineering-infra when the OpenTofu migration reaches it - the
+# coolify-terraform/coolify provider supports import on every stateful resource,
+# so building it here now costs no rework later.
+#
+# Adding a repo to the mirror = one entry in MIRROR_REPOS + installing the
+# GitHub App on that repo. Nothing is added to the mirrored repo itself.
+
+services:
+  mirror:
+    build: .
+    restart: unless-stopped
+    environment:
+      # --- identity -----------------------------------------------------
+      # Buzz key for the mirror-bot identity. Needs to be a member of every
+      # bound channel: git read on Buzz is membership-gated, so losing channel
+      # membership presents as a 404 on fetch, not as an auth error.
+      BUZZ_PRIVATE_KEY: ${BUZZ_PRIVATE_KEY:?}
+      BUZZ_AUTH_TAG: ${BUZZ_AUTH_TAG:?}
+      BUZZ_RELAY_URL: https://buzz.gitcoin.co
+
+      # GitHub App. The PEM arrives as an env var and the entrypoint moves it to
+      # a 0400 tmpfs file immediately - see entrypoint.sh for why that is a
+      # compromise rather than a solution.
+      GITHUB_APP_ID: ${GITHUB_APP_ID:?}
+      GITHUB_APP_PEM: ${GITHUB_APP_PEM:?}
+
+      # --- what to mirror -----------------------------------------------
+      BUZZ_REPO_OWNER: 20498bf7727e4c607731692863a5c8bcc0aca892272be392cb05758f45d92c1d
+      MIRROR_REPOS: >-
+        {"regenos-dev": "irlfund/regenOS",
+         "local-almanac-mirror": "irlfund/local-almanac"}
+
+      # Where halt and recovery messages go.
+      MIRROR_ALERT_CHANNEL: ffaf8f45-5aad-4a8a-9b57-c0ae343709b7
+
+      MIRROR_INTERVAL_SECS: "60"
+
+    volumes:
+      # Bare clones + sticky halt state. Must persist across restarts, or a
+      # restart re-posts every active halt.
+      - mirror-state:/var/lib/git-mirror
+
+    tmpfs:
+      # uid must match the pinned uid in the Dockerfile.
+      - /run/mirror:mode=700,uid=10001
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  mirror-state:

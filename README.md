@@ -12,14 +12,25 @@ Buzz relays host real git repos over smart HTTP, authenticated with a nostr key 
 of a password. That makes Buzz a fine primary origin — agents and humans push there — but you
 still want GitHub current for the humans, tooling, and CI that live there.
 
-The obvious approach is a daemon holding a GitHub deploy key. This does the opposite:
+Two mechanisms live here. **Start with the daemon** ([`docs/DAEMON.md`](docs/DAEMON.md)) — the
+Action came first and taught us the shape, but it costs a workflow file and two secrets *in every
+mirrored repo*, which does not scale.
+
+| | Action | Daemon |
+|---|---|---|
+| per-repo cost | workflow file + 2 secrets | none |
+| adding a repo | commit + secrets | one config line + an App install click |
+| GitHub write credential | none — uses `GITHUB_TOKEN` | a GitHub App key, off-platform |
+| latency | ~10 min | ~60s |
+| GitHub ahead | fails red | proposes a branch + PR, halts |
+
+The Action's one real advantage is that no GitHub write credential exists anywhere:
 
 > A scheduled GitHub Action **pulls** from Buzz and fast-forwards `main`, pushing with the
 > built-in `GITHUB_TOKEN`.
 
-Nothing that can write to GitHub is ever stored anywhere. The only secret is a Buzz *read* key
-for a dedicated `mirror-bot` identity — if it leaks, someone can read one channel's repos, and
-you rotate it by removing that identity from the channel.
+Its only secret is a Buzz *read* key for a dedicated `mirror-bot` identity. The daemon gives that
+up in exchange for scaling: it holds a GitHub App key that can write the repos it is installed on.
 
 ```
   agent / human                 Buzz relay                    GitHub
@@ -45,14 +56,23 @@ you rotate it by removing that identity from the channel.
 
 | Path | What |
 |---|---|
-| `.github/workflows/buzz-mirror-main.yml` | the mirror job |
+| `mirror/daemon.py` | the daemon — one container, any number of repos |
+| `mirror/healthcheck.sh` | staleness check; container healthcheck *and* Coolify scheduled task |
+| `mirror/test_reconcile.py` | all four ancestry cases against real repos |
+| `Dockerfile`, `docker-compose.yml` | the Coolify application |
+| `docs/DAEMON.md` | how the daemon works and why it is shaped this way |
+| `.github/workflows/buzz-mirror-main.yml` | the original Action — superseded by the daemon |
 | `docs/SETUP.md` | setup, and the sharp edges worth knowing first |
 | `buzz-agent-identity.py` | provision a Buzz agent identity — fresh key + NIP-OA owner attestation, pure stdlib |
 
-Start with [`docs/SETUP.md`](docs/SETUP.md).
+Start with [`docs/DAEMON.md`](docs/DAEMON.md); [`docs/SETUP.md`](docs/SETUP.md) covers the Buzz-side
+git sharp edges that apply to both.
 
 ## Status
 
 The Buzz half is verified against a live relay: channel binding, clone, push, ref-state events,
-and all four sync paths (create / in-sync / fast-forward / diverged). The Action itself is
-exercised by this repo — if the badge-less `main` here matches Buzz, it works.
+and all four sync paths (create / in-sync / fast-forward / diverged). The Action is exercised by
+this repo — if `main` here matches Buzz, it works.
+
+The daemon's decision tree is covered by `mirror/test_reconcile.py` against real repos. It has
+**not** yet run against the live relay or a real GitHub App — that needs the App to exist.
