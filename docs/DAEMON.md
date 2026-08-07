@@ -146,6 +146,7 @@ The form is long and almost all of it is irrelevant. What matters:
 | Homepage URL | any URL | required by the form; nothing reads it |
 | Callback URL / Setup URL | blank | no user-facing OAuth flow |
 | Request user authorization (OAuth) | **unchecked** | the App acts as itself, never on behalf of a user |
+| Expire user authorization tokens | leave **checked** (default) | inert here — it governs *user*-to-server tokens, and with OAuth off none are ever minted. Leave it on anyway: unchecking means non-expiring user tokens if anyone enables OAuth later. It does **not** affect the installation tokens the daemon uses, which expire after an hour regardless and are not configurable |
 | Enable Device Flow | **unchecked** | — |
 | **Webhook → Active** | **UNCHECK** | default is *on* and then demands a public Webhook URL. The daemon polls, so it needs no ingress at all |
 | Subscribe to events | none | greyed out once the webhook is inactive |
