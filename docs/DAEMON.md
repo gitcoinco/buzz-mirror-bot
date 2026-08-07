@@ -54,8 +54,8 @@ command above is the whole operation.
 One message per halt, not one per tick. The halt holds until the tips converge, then the daemon
 posts a recovery message.
 
-Halt reasons are named — `buzz-auth-failed`, `github-auth-failed`, `diverged`, `push-rejected`,
-`reconcile-failed` — because the sharpest failure mode here is mirror-bot being dropped from a
+Halt reasons are named — `buzz-auth-failed`, `github-auth-failed`, `github-not-installed`,
+`diverged`, `push-rejected`, `reconcile-failed` — because the sharpest failure mode here is mirror-bot being dropped from a
 bound channel: git read on Buzz is membership-gated, so it presents as a 404 on fetch and looks
 exactly like a GitHub outage. Naming the subsystem is the entire fix.
 
@@ -145,7 +145,7 @@ The form is long and almost all of it is irrelevant. What matters:
 | Enable Device Flow | **unchecked** | — |
 | **Webhook → Active** | **UNCHECK** | default is *on* and then demands a public Webhook URL. The daemon polls, so it needs no ingress at all |
 | Subscribe to events | none | greyed out once the webhook is inactive |
-| Where can this be installed | **Only on this account** | correct when created under the org |
+| Where can this be installed | **Any account** | see below — required if the repos you mirror span more than one account |
 
 Repository permissions — set exactly two, leave every other row on *No access*:
 
@@ -165,9 +165,29 @@ After **Create GitHub App**:
 1. The **App ID** is at the top of the settings page → `GITHUB_APP_ID`.
 2. **Private keys → Generate a private key** downloads a `.pem`. Keys are generated, not shown
    again — but you can generate more and revoke old ones at any time, so losing it is recoverable.
-3. **Install App** (left sidebar) → install on the org → **Only select repositories** → pick the
-   repos to mirror. This is the per-repo approval step, and it is the only thing needed to add a
-   repo later.
+3. **Install App** (left sidebar) → **Only select repositories** → pick the repos to mirror.
+   Repeat **once per account** whose repos you mirror. This is the per-repo approval step, and
+   installing on a repo is the only thing needed to add it later.
+
+### Installations are per account, not per App
+
+An App set to *Any account* gets a **separate installation for every account it is installed on**,
+each with its own id and its own tokens. A token minted for one installation is not valid for
+another, so the unit of authentication is the *account*, not the App. The daemon handles this:
+it reads the owner from each `MIRROR_REPOS` entry and mints one token per distinct account.
+
+Two consequences worth knowing:
+
+- **The App must be installed separately on every account you mirror** — your personal account and
+  each org are separate installs. Forgetting one halts only that repo, with reason
+  `github-not-installed` naming the account; the others keep mirroring.
+- **`Any account` makes the App's install page publicly reachable** at `github.com/apps/<slug>`,
+  and GitHub offers no way to restrict it to a list of accounts. If a stranger installs it they
+  are granting *this daemon* access to *their* repos, not gaining access to yours — so the
+  exposure is theirs, not yours. The daemon ignores any installation whose account is not named
+  in `MIRROR_REPOS`.
+
+Choose *Only on this account* only if every repo you will ever mirror lives in that one account.
 
 ### Where the private key goes
 

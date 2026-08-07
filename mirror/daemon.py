@@ -141,20 +141,33 @@ def api(path, token, method="GET", scheme="Bearer"):
         return json.loads(r.read())
 
 
-def installation_token():
-    """Mint a fresh installation token. Discovering the installation id here
-    rather than configuring it is deliberate - it is derivable from the PEM, so
-    it should not be one more value a human has to find and copy."""
+def installation_tokens(accounts):
+    """Mint one installation token per GitHub account we mirror.
+
+    An App set to "Any account" gets a *separate installation per account* -
+    a personal account and two orgs are three installations with three ids and
+    three tokens, and a token is only valid for its own installation. So the
+    unit of auth here is the account, not the App.
+
+    Installation ids are discovered rather than configured: they are derivable
+    from the PEM, so they should not be values a human has to find and copy.
+
+    Returns (token by lowercased account, accounts with no installation).
+    Accounts the App happens to be installed on but that we do not mirror are
+    ignored - with "Any account" the install page is publicly reachable, so the
+    installation list is not something this daemon should assume it controls.
+    """
     j = app_jwt()
-    installs = api("/app/installations", j)
-    if not installs:
-        raise RuntimeError("GitHub App is not installed on any account")
-    if len(installs) > 1:
-        # Ambiguous rather than wrong: pick nothing and say so.
-        accounts = ", ".join(i["account"]["login"] for i in installs)
-        raise RuntimeError(f"App installed on multiple accounts ({accounts}); pin one")
-    tok = api(f"/app/installations/{installs[0]['id']}/access_tokens", j, method="POST")
-    return tok["token"]
+    installs = {i["account"]["login"].lower(): i["id"] for i in api("/app/installations", j)}
+    tokens, missing = {}, []
+    for acct in {a.lower() for a in accounts}:
+        if acct not in installs:
+            missing.append(acct)
+            continue
+        tokens[acct] = api(
+            f"/app/installations/{installs[acct]}/access_tokens", j, method="POST"
+        )["token"]
+    return tokens, missing
 
 
 # --------------------------------------------------------------------------
@@ -327,11 +340,25 @@ def reconcile(repo_id, gh_repo, token, state):
 
 def tick():
     state = load_state()
-    token = installation_token()  # one token per tick; they expire in an hour
+    # Tokens expire in an hour and are per-account; mint them once per tick and
+    # reuse across repos that share an owner.
+    tokens, missing = installation_tokens(
+        {gh.split("/", 1)[0] for gh in REPOS.values()}
+    )
     ok = True
     for repo_id, gh_repo in REPOS.items():
+        owner = gh_repo.split("/", 1)[0].lower()
+        if owner in missing:
+            # Its own reason: forgetting to install the App on one of several
+            # accounts is the likeliest setup mistake once repos span accounts,
+            # and it is nothing like an auth failure to debug.
+            ok = False
+            halt(state, repo_id, "github-not-installed",
+                 f"The GitHub App is not installed on `{owner}`. Install it there and "
+                 f"grant access to `{gh_repo}`.")
+            continue
         try:
-            reconcile(repo_id, gh_repo, token, state)
+            reconcile(repo_id, gh_repo, tokens[owner], state)
         except Exception as e:
             ok = False
             # Name the subsystem. "Looks like a GitHub outage but is actually a

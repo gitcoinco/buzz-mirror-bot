@@ -142,6 +142,65 @@ daemon.reconcile("r", "o/r", "tok", state)
 check("halt cleared", not state["r"].get("halted"))
 check("announced recovery", any("recovered" in p for p in POSTS))
 
+# ---------------------------------------------------------------------------
+# multi-account installations
+#
+# An App set to "Any account" gets one installation PER account. A token minted
+# for one installation is not valid for another, so the mapping from repo owner
+# to token is the thing that has to be right.
+# ---------------------------------------------------------------------------
+
+print("\n--- multi-account installations")
+
+API_CALLS = []
+
+
+def fake_api(path, token, method="GET", scheme="Bearer"):
+    API_CALLS.append(path)
+    if path == "/app/installations":
+        return [
+            {"id": 11, "account": {"login": "irlfund"}},
+            {"id": 22, "account": {"login": "gitcoinco"}},
+            {"id": 33, "account": {"login": "Lucian"}},       # note the case
+            {"id": 44, "account": {"login": "someone-else"}},  # not ours
+        ]
+    return {"token": "tok-" + path.split("/")[3]}
+
+
+daemon.app_jwt = lambda: "jwt"
+daemon.api = fake_api
+
+tokens, missing = daemon.installation_tokens({"irlfund", "gitcoinco", "lucian"})
+check("one token per account", len(tokens) == 3)
+check("irlfund -> its own installation", tokens["irlfund"] == "tok-11")
+check("gitcoinco -> its own installation", tokens["gitcoinco"] == "tok-22")
+check("account matching is case-insensitive", tokens["lucian"] == "tok-33")
+check("nothing missing", missing == [])
+check("no token minted for accounts we do not mirror",
+      "/app/installations/44/access_tokens" not in API_CALLS)
+
+tokens, missing = daemon.installation_tokens({"irlfund", "not-installed-org"})
+check("uninstalled account reported, not raised", missing == ["not-installed-org"])
+check("other accounts still usable", tokens["irlfund"] == "tok-11")
+
+# A repo whose account has no installation halts with its own reason, and does
+# not take the other repos down with it.
+daemon.REPOS = {"good": "irlfund/regenOS", "bad": "nope-org/thing"}
+daemon.reconcile = lambda repo_id, gh, tok, st: st.update({repo_id: {"ok": tok}})
+daemon.load_state = lambda: {}
+saved = {}
+daemon.save_state = lambda s: saved.update(s)
+daemon.touch_last_success = lambda: saved.update({"_touched": True})
+POSTS.clear()
+daemon.tick()
+check("uninstalled repo halts as github-not-installed",
+      saved.get("bad", {}).get("halted") == "github-not-installed")
+check("healthy repo still reconciled with its own account's token",
+      saved.get("good", {}).get("ok") == "tok-11")
+check("last-success NOT touched while a repo is halted", "_touched" not in saved)
+check("halt message names the account to install on",
+      any("nope-org" in p for p in POSTS))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nFAILED" if FAILED else "\nall passed")
 sys.exit(1 if FAILED else 0)
