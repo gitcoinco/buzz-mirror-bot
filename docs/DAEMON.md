@@ -128,13 +128,63 @@ single-line value with literal `\n` escapes; both paths normalise to the same by
 entrypoint checks for `BEGIN`/`END` markers and refuses to start on a mangled value rather than
 failing later with an opaque JWT error.
 
-### GitHub App permissions
+### Creating the GitHub App
 
-`contents: write` **and** `workflows: write`.
+There is no API for this — the App is created in a browser, once. Create it **under the
+organisation that owns the repos**, not a personal account, so it outlives any one person:
+`https://github.com/organizations/<org>/settings/apps/new`.
 
-`workflows: write` is not optional: both mirrored repos carry files under `.github/workflows/`,
+The form is long and almost all of it is irrelevant. What matters:
+
+| field | value | why |
+|---|---|---|
+| GitHub App name | anything unique across GitHub | e.g. `<org>-buzz-mirror` |
+| Homepage URL | any URL | required by the form; nothing reads it |
+| Callback URL / Setup URL | blank | no user-facing OAuth flow |
+| Request user authorization (OAuth) | **unchecked** | the App acts as itself, never on behalf of a user |
+| Enable Device Flow | **unchecked** | — |
+| **Webhook → Active** | **UNCHECK** | default is *on* and then demands a public Webhook URL. The daemon polls, so it needs no ingress at all |
+| Subscribe to events | none | greyed out once the webhook is inactive |
+| Where can this be installed | **Only on this account** | correct when created under the org |
+
+Repository permissions — set exactly two, leave every other row on *No access*:
+
+- **Contents: Read and write**
+- **Workflows: Read and write**
+
+`Metadata: Read-only` selects itself and cannot be turned off; that is expected. Set no
+organisation or account permissions.
+
+`workflows: write` is not optional: the mirrored repos carry files under `.github/workflows/`,
 and GitHub rejects any App push that touches them without it. Note what it grants — an actor who
-can write a workflow file can execute arbitrary code in Actions with that repo's secrets.
+can write a workflow file can execute arbitrary code in Actions with that repo's secrets. It is
+the sharpest permission in this design and it is load-bearing.
+
+After **Create GitHub App**:
+
+1. The **App ID** is at the top of the settings page → `GITHUB_APP_ID`.
+2. **Private keys → Generate a private key** downloads a `.pem`. Keys are generated, not shown
+   again — but you can generate more and revoke old ones at any time, so losing it is recoverable.
+3. **Install App** (left sidebar) → install on the org → **Only select repositories** → pick the
+   repos to mirror. This is the per-repo approval step, and it is the only thing needed to add a
+   repo later.
+
+### Where the private key goes
+
+Into the Coolify application as `GITHUB_APP_PEM_B64`, and nowhere else. Not the repo, not a
+checkout, not a shared drive.
+
+```sh
+base64 < ~/Downloads/<app-name>.<date>.private-key.pem | tr -d '\n' | pbcopy
+```
+
+(`tr -d '\n'` rather than `base64 -w0`: the flag is GNU-only and macOS ships BSD base64.)
+
+Then delete the download. The key is regenerable, so a local copy is pure liability:
+
+```sh
+rm -P ~/Downloads/<app-name>.<date>.private-key.pem   # -P overwrites first; macOS
+```
 
 ## Tests
 
