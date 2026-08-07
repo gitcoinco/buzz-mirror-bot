@@ -55,9 +55,9 @@ One message per halt, not one per tick. The halt holds until the tips converge, 
 posts a recovery message.
 
 Halt reasons are named — `buzz-auth-failed`, `github-auth-failed`, `github-not-installed`,
-`diverged`, `push-rejected`, `reconcile-failed` — because the sharpest failure mode here is mirror-bot being dropped from a
-bound channel: git read on Buzz is membership-gated, so it presents as a 404 on fetch and looks
-exactly like a GitHub outage. Naming the subsystem is the entire fix.
+`diverged`, `push-rejected`, `reconcile-failed`. The sharpest failure mode here is mirror-bot
+being dropped from a bound channel: git read on Buzz is membership-gated, so it presents as a 404
+on fetch and looks exactly like a GitHub outage. Naming the subsystem is the entire fix.
 
 Halt messages also say **"deploys for this repo are frozen"**, because Coolify deploys from
 GitHub. A halted mirror is not cosmetic — Buzz-side work stops reaching production.
@@ -108,7 +108,7 @@ stateful resource, so building it in the UI now costs no rework later.
 | `BUZZ_PRIVATE_KEY` | mirror-bot's nostr key. Must be a member of every bound channel |
 | `BUZZ_AUTH_TAG` | NIP-OA owner attestation |
 | `GITHUB_APP_ID` | the App's id |
-| `GITHUB_APP_PEM_B64` | the App private key, base64 (`base64 -w0 key.pem`) |
+| `GITHUB_APP_PEM_B64` | the App private key, base64 (`base64 < key.pem \| tr -d '\\n'`) |
 | `BUZZ_REPO_OWNER` | 64-char hex pubkey that announced the repos |
 | `MIRROR_REPOS` | JSON, `{"<buzz-repo-id>": "<owner>/<repo>"}` |
 | `MIRROR_ALERT_CHANNEL` | channel UUID for halt and recovery messages |
@@ -130,9 +130,13 @@ failing later with an opaque JWT error.
 
 ### Creating the GitHub App
 
-There is no API for this — the App is created in a browser, once. Create it **under the
-organisation that owns the repos**, not a personal account, so it outlives any one person:
+There is no API for this — the App is created in a browser, once. Create it **under an
+organisation**, not a personal account, so it outlives any one person:
 `https://github.com/organizations/<org>/settings/apps/new`.
+
+Where it is *created* and where it can be *installed* are independent: an org-owned App set to
+*Any account* installs onto personal accounts and other orgs perfectly well. Creating it in an org
+is purely about ownership and survivorship.
 
 The form is long and almost all of it is irrelevant. What matters:
 
