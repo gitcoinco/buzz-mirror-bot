@@ -1,20 +1,18 @@
-# The mirror daemon
+# The mirror
 
 The Action in this repo works, but it costs a workflow file and two Actions secrets **in every
 mirrored repo**. That per-repo cost is the whole problem: it does not scale past a handful of
 repos, and it means adding a repo to the mirror is a commit plus a secrets dance rather than a
 config line.
 
-The daemon replaces it. One long-running container mirrors any number of repos, and adding one is:
-
-1. a line in `MIRROR_REPOS`
-2. installing the GitHub App on that repo
-
-Nothing lands in the mirrored repo itself.
+This replaces it. One deployment mirrors any number of repos, and enrolling one is **a tick in
+the GitHub App's install UI**. There is no repo list anywhere — see [What gets
+mirrored](#what-gets-mirrored). Nothing lands in the mirrored repo itself, and nothing needs a
+config edit or a redeploy.
 
 ## What it does
 
-Every 60s, per repo, it fetches both `main`s into a bare clone and compares them:
+Per repo, per run, it fetches both `main`s into a bare clone and compares them:
 
 | ancestry | action |
 |---|---|
@@ -28,7 +26,7 @@ outcome is that a repo stops mirroring and says so.
 
 ### GitHub ahead is the error case, and it is propose-only
 
-The daemon never pushes GitHub's tip onto Buzz `main`. It pushes it to
+The mirror never pushes GitHub's tip onto Buzz `main`. It pushes it to
 `mirror/github-ahead-<sha>`, opens a NIP-34 PR, and posts the one-line command to adopt it:
 
 ```sh
@@ -51,10 +49,10 @@ command above is the whole operation.
 
 ### Halts are sticky, and they say what they cost
 
-One message per halt, not one per tick. The halt holds until the tips converge, then the daemon
+One message per halt, not one per tick. The halt holds until the tips converge, then it
 posts a recovery message.
 
-Halt reasons are named — `buzz-auth-failed`, `github-auth-failed`, `github-not-installed`,
+Halt reasons are named — `buzz-auth-failed`, `github-auth-failed`,
 `diverged`, `push-rejected`, `reconcile-failed`. The sharpest failure mode here is mirror-bot
 being dropped from a bound channel: git read on Buzz is membership-gated, so it presents as a 404
 on fetch and looks exactly like a GitHub outage. Naming the subsystem is the entire fix.
@@ -62,33 +60,104 @@ on fetch and looks exactly like a GitHub outage. Naming the subsystem is the ent
 Halt messages also say **"deploys for this repo are frozen"**, because Coolify deploys from
 GitHub. A halted mirror is not cosmetic — Buzz-side work stops reaching production.
 
+## What gets mirrored
+
+Discovered every run, never configured. The mirror set is the **intersection** of two opt-ins:
+
+1. the repo is **announced on Buzz** under `BUZZ_REPO_OWNER` with a GitHub URL in its `web` tag
+2. the repo is **granted to the GitHub App** — install with *Only select repositories* and tick it
+
+Enrolling a repo is (2). Unenrolling is unticking it. No env var, no redeploy.
+
+The pairing comes from the announcement's `web` tag rather than from matching names, because the
+names do not match: `regenos-dev` is `irlfund/regenOS` and `local-almanac-mirror` is
+`irlfund/local-almanac`. The `kind:30617` already carries both `d` (the repo id the git endpoint
+is keyed by) and `web`, so the mapping is *declared* by whoever created the repo.
+
+Requiring both sides is also what makes an **"Any account"** App safe to leave open: a stranger
+who installs it gets nothing mirrored, because none of their repos are announced under your
+pubkey. See [Multi-account installations](#multi-account-installations).
+
+A repo that satisfies only one side is **logged, not halted** — the GitHub grant is the enrolment
+action, so a Buzz repo nobody intends to mirror is not an error, and halting on it would alert
+forever. Both directions appear in the log every run, so a mis-click is visible:
+
+```
+github: irlfund granted 3 repo(s): agentic-engineering-infra, local-almanac, regenOS
+mirroring regenos-dev -> irlfund/regenOS
+skipped, announced on buzz but the App is not granted them: buzz-only -> irlfund/never-granted
+skipped, granted to the App but not announced on buzz: gitcoinco/some-org-repo
+```
+
+Discovering **zero** repos exits non-zero. An empty mirror set is never intended, and staying
+quiet about it would read exactly like "everything is in sync".
+
+`MIRROR_ONLY` (a JSON array of buzz repo-ids) restricts the set further. It exists to point a
+test deployment at one scratch repo; leave it unset in production.
+
 ## Run it as a scheduled task, not a long-running process
 
-Every tick is self-contained: state lives in `state.json` and the bare clones on the volume,
-never in memory. So the loop is *only* a scheduler, and if the platform already has one it should
-own the schedule instead.
+Every run is self-contained: state lives in `state.json` and the bare clones on the volume, never
+in memory. So the loop is *only* a scheduler, and if the platform already has one it should own
+the schedule instead.
 
 ```sh
-python3 mirror/daemon.py --once     # one reconcile, exit non-zero if anything failed
+python3 mirror/sync.py --once     # one reconcile, exit non-zero if anything failed
 ```
 
 Run that as a **Coolify scheduled task**. The run's own exit status is the alert, and Coolify's
 **Scheduled Task Failure** notification fires on it directly — email / Slack / Discord / Telegram
-/ Pushover / webhook, out-of-band from Buzz and from the daemon's own identity.
+/ Pushover / webhook, out-of-band from Buzz and from the mirror's own identity.
 
-That deletes a whole layer: no `last-success` file, no staleness probe, no container healthcheck,
-no second scheduled task watching the first. One thing runs, and when it fails you are told.
+### It still needs a container to be up
+
+Coolify's scheduled tasks `docker exec` into an **already-running** container — from
+`app/Jobs/ScheduledTaskJob.php`:
+
+```php
+$cmd  = "sh -c '".str_replace("'", "'\''", $this->task->command)."'";
+$exec = "docker exec {$containerName} {$cmd}";
+```
+
+They do not start one, and Coolify has no host-level cron at all
+([#8500](https://github.com/coollabsio/coolify/issues/8500)). So the deployed shape is:
+
+| | |
+|---|---|
+| main process | `sleep infinity` — exists only to be exec'd into |
+| scheduled task | `/app/mirror/entrypoint.sh --once` — the actual mirror run |
+
+A `sleep infinity` main process looks pointless. The payoff is that **one notification path covers
+two failures**: the command runs through `instant_remote_process(..., throwError: true)`, so a
+non-zero exit is recorded as `status => 'failed'` and sends `TaskFailed` — and if the container is
+gone, container discovery finds no name and the exec fails the same way. A dead mirror and a
+missing mirror alert identically.
+
+That still deletes a layer: no `last-success` file, no staleness probe, no container healthcheck,
+no second scheduled task watching the first.
+
+Concurrent runs are handled with an exclusive `flock` on `$MIRROR_STATE_DIR/lock`, because Coolify
+does not dedupe: if a reconcile outlives the cron interval the next exec starts anyway, and two
+runs would interleave fetches on the same bare clones. An overlapping run exits **0** — paging
+someone about a slow tick is how an alert channel gets ignored.
 
 ### Liveness
 
-Falls out of the above. A failed run notifies. A run that never happens is Coolify's scheduler
-being down, which is the same failure as the host being down.
+Falls out of the above. A failed run notifies, and so does a missing container. A run that never
+happens is Coolify's scheduler being down, which is the same failure as the host being down.
 
 The **loop mode** (no `--once`) exists for when no scheduler is available or a sub-minute interval
-is wanted. It costs more: `last-success` + `mirror/healthcheck.sh` as a container `HEALTHCHECK`
-so Coolify restarts a wedged-but-running process, plus a separate scheduled staleness check for
-the alert. A wedged long-running process never exits to be noticed, and an alert that shares a
-process with the thing it watches is not an alert.
+is wanted. It costs more: drop `command:` from the compose file, and add back `last-success` +
+`mirror/healthcheck.sh` as a container `HEALTHCHECK` so Coolify restarts a wedged-but-running
+process, plus a separate scheduled staleness check for the alert:
+
+```dockerfile
+HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
+    CMD /app/mirror/healthcheck.sh
+```
+
+A wedged long-running process never exits to be noticed, and an alert that shares a process with
+the thing it watches is not an alert.
 
 > **Verify the notification fires.** There are open Coolify reports of failure notifications not
 > being sent while success notifications are. Test it once with a deliberate failure. An alarm you
@@ -125,15 +194,18 @@ stateful resource, so building it in the UI now costs no rework later.
 | `GITHUB_APP_ID` | the App's id |
 | `GITHUB_APP_PEM_B64` | the App private key, base64 (`base64 < key.pem \| tr -d '\\n'`) |
 | `BUZZ_REPO_OWNER` | 64-char hex pubkey that announced the repos |
-| `MIRROR_REPOS` | JSON, `{"<buzz-repo-id>": "<owner>/<repo>"}` |
 | `MIRROR_ALERT_CHANNEL` | channel UUID for halt and recovery messages |
-| `MIRROR_INTERVAL_SECS` | reconcile interval, default 60 |
+| `MIRROR_ONLY` | *optional.* JSON array of buzz repo-ids to restrict to. Unset = everything discovered |
+| `MIRROR_INTERVAL_SECS` | loop mode only; ignored by `--once`. Default 60 |
 
-The **installation id is not configured** — the daemon discovers it from the PEM via
+**There is no repo list.** `MIRROR_REPOS` is gone; setting it is now a hard startup error rather
+than a silently ignored value. See [What gets mirrored](#what-gets-mirrored).
+
+The **installation id is not configured** either — it is discovered from the PEM via
 `GET /app/installations`. It is derivable, so it should not be one more value a human has to find.
 
 The PEM arrives as an environment variable and the entrypoint moves it to a `0400` tmpfs file
-before starting the daemon. That is weaker than systemd's `LoadCredential`, since it transits an
+before anything else runs. That is weaker than systemd's `LoadCredential`, since it transits an
 env var on the way in; it is the accepted cost of deploying through Coolify rather than as a host
 unit.
 
@@ -161,9 +233,9 @@ The form is long and almost all of it is irrelevant. What matters:
 | Homepage URL | any URL | required by the form; nothing reads it |
 | Callback URL / Setup URL | blank | no user-facing OAuth flow |
 | Request user authorization (OAuth) | **unchecked** | the App acts as itself, never on behalf of a user |
-| Expire user authorization tokens | leave **checked** (default) | inert here — it governs *user*-to-server tokens, and with OAuth off none are ever minted. Leave it on anyway: unchecking means non-expiring user tokens if anyone enables OAuth later. It does **not** affect the installation tokens the daemon uses, which expire after an hour regardless and are not configurable |
+| Expire user authorization tokens | leave **checked** (default) | inert here — it governs *user*-to-server tokens, and with OAuth off none are ever minted. Leave it on anyway: unchecking means non-expiring user tokens if anyone enables OAuth later. It does **not** affect the installation tokens the mirror uses, which expire after an hour regardless and are not configurable |
 | Enable Device Flow | **unchecked** | — |
-| **Webhook → Active** | **UNCHECK** | default is *on* and then demands a public Webhook URL. The daemon polls, so it needs no ingress at all |
+| **Webhook → Active** | **UNCHECK** | default is *on* and then demands a public Webhook URL. It polls, so it needs no ingress at all |
 | Subscribe to events | none | greyed out once the webhook is inactive |
 | Where can this be installed | **Any account** | see below — required if the repos you mirror span more than one account |
 
@@ -189,23 +261,31 @@ After **Create GitHub App**:
    Repeat **once per account** whose repos you mirror. This is the per-repo approval step, and
    installing on a repo is the only thing needed to add it later.
 
-### Installations are per account, not per App
+### Multi-account installations
 
 An App set to *Any account* gets a **separate installation for every account it is installed on**,
 each with its own id and its own tokens. A token minted for one installation is not valid for
-another, so the unit of authentication is the *account*, not the App. The daemon handles this:
-it reads the owner from each `MIRROR_REPOS` entry and mints one token per distinct account.
+another, so the unit of authentication is the *account*, not the App. Discovery walks every
+installation and pairs each repo with the token for *its own* account.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - **The App must be installed separately on every account you mirror** — your personal account and
-  each org are separate installs. Forgetting one halts only that repo, with reason
-  `github-not-installed` naming the account; the others keep mirroring.
+  each org are separate installs. Forgetting one just means those repos never appear in the
+  discovered set; the log line naming what each account granted is where you see it.
 - **`Any account` makes the App's install page publicly reachable** at `github.com/apps/<slug>`,
   and GitHub offers no way to restrict it to a list of accounts. If a stranger installs it they
-  are granting *this daemon* access to *their* repos, not gaining access to yours — so the
-  exposure is theirs, not yours. The daemon ignores any installation whose account is not named
-  in `MIRROR_REPOS`.
+  are granting *this App* access to *their* repos, not gaining access to yours — the exposure is
+  theirs. And because the mirror set requires a Buzz announcement under your pubkey too, their
+  repos are skipped rather than mirrored anywhere.
+- **One token is minted per installation, including ones nothing is used from.** There is no
+  App-JWT endpoint that lists an installation's repositories, so the token is the only way to see
+  inside one; unwanted ones are discarded immediately. Every account's grants are logged, so a
+  stray installation is visible rather than merely harmless.
+
+What bounds the blast radius is the **per-install repo selection**: choose *Only select
+repositories*, never *All repositories*. A compromise of the PEM then reaches exactly the repos
+that were ticked, per account, and nothing else.
 
 Choose *Only on this account* only if every repo you will ever mirror lives in that one account.
 

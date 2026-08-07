@@ -5,19 +5,33 @@
 # coolify-terraform/coolify provider supports import on every stateful resource,
 # so building it here now costs no rework later.
 #
-# Adding a repo to the mirror = one entry in MIRROR_REPOS + installing the
-# GitHub App on that repo. Nothing is added to the mirrored repo itself.
-
-# Preferred deployment is a Coolify **scheduled task** running:
-#     /app/mirror/entrypoint.sh --once
-# The run's exit status is then the alert (Scheduled Task Failure), and none of
-# the healthcheck/staleness machinery is needed. This compose file describes the
-# loop mode, for when no scheduler is available.
+# Adding a repo to the mirror is a tick in the GitHub App's install UI. There is
+# no repo list here: the mirror set is discovered as the intersection of "granted
+# to the App" and "announced on Buzz with a GitHub `web` tag". Nothing is added
+# to the mirrored repo itself, and nothing here needs editing or redeploying.
+#
+# Deployed shape, and the reason for the odd-looking `command`:
+#
+#   main process    sleep infinity                   (below)
+#   scheduled task  /app/mirror/entrypoint.sh --once (created in the Coolify UI)
+#
+# Coolify's scheduled tasks `docker exec` into a *running* container rather than
+# starting one, and Coolify has no host-level cron, so the container has to stay
+# up even though the mirror itself is a one-shot. The exit status of `--once` is
+# then the alert (Scheduled Task Failure) - and because the exec also fails when
+# no container is running, that one path covers liveness too. No healthcheck, no
+# staleness probe, no second task watching the first.
+#
+# To run the loop instead - anywhere without a scheduler - drop `command` and
+# restore the HEALTHCHECK; see docs/MIRROR.md.
 
 services:
   mirror:
     build: .
     restart: unless-stopped
+    # See the header: the reconcile runs as a Coolify scheduled task, and this
+    # only exists to give that task a container to exec into.
+    command: ["sleep", "infinity"]
     environment:
       # --- identity -----------------------------------------------------
       # Buzz key for the mirror-bot identity. Needs to be a member of every
@@ -38,14 +52,15 @@ services:
       GITHUB_APP_PEM_B64: ${GITHUB_APP_PEM_B64:?}
 
       # --- what to mirror -----------------------------------------------
+      # The only knob: whose Buzz repo announcements to read. Everything else
+      # is discovered. MIRROR_ONLY (a JSON array of buzz repo-ids) exists to
+      # point a test deployment at one scratch repo; leave it unset in prod.
       BUZZ_REPO_OWNER: 20498bf7727e4c607731692863a5c8bcc0aca892272be392cb05758f45d92c1d
-      MIRROR_REPOS: >-
-        {"regenos-dev": "irlfund/regenOS",
-         "local-almanac-mirror": "irlfund/local-almanac"}
 
       # Where halt and recovery messages go.
       MIRROR_ALERT_CHANNEL: ffaf8f45-5aad-4a8a-9b57-c0ae343709b7
 
+      # Loop mode only; ignored by --once, where Coolify's cron sets the pace.
       MIRROR_INTERVAL_SECS: "60"
 
     volumes:

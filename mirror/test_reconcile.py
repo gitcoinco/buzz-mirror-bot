@@ -25,23 +25,22 @@ os.environ.update(
     MIRROR_STATE_DIR=os.path.join(TMP, "state"),
     MIRROR_ALERT_CHANNEL="test-channel",
     GITHUB_APP_ID="1",
-    MIRROR_REPOS="{}",
     BUZZ_REPO_OWNER="deadbeef",
 )
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import daemon  # noqa: E402
+import sync  # noqa: E402
 
 POSTS = []
-daemon.post = lambda text: POSTS.append(text)
-daemon.open_pr = lambda *a, **k: "buzz://pr/test"
+sync.post = lambda text: POSTS.append(text)
+sync.open_pr = lambda *a, **k: "buzz://pr/test"
 
 BUZZ = os.path.join(TMP, "buzz.git")
 GITHUB = os.path.join(TMP, "github.git")
 
 # Route both "remotes" at local bare repos. The daemon's own git invocation,
 # fetch/push logic and ancestry checks are all exercised for real.
-daemon.buzz_url = lambda repo_id: BUZZ
-daemon.github_url = lambda gh_repo, token: GITHUB
+sync.buzz_url = lambda repo_id: BUZZ
+sync.github_url = lambda gh_repo, token: GITHUB
 
 
 def sh(*args, cwd=None):
@@ -90,7 +89,7 @@ FAILED = False
 
 # 1. in sync -> no push, no message
 work, base = scenario("in sync")
-daemon.reconcile("r", "o/r", "tok", {})
+sync.reconcile("r", "o/r", "tok", {})
 check("github unchanged", tip(GITHUB) == base)
 check("silent", POSTS == [])
 
@@ -98,7 +97,7 @@ check("silent", POSTS == [])
 work, base = scenario("buzz ahead")
 new = commit(work, "buzz work")
 sh("git", "push", "-q", BUZZ, "main:main", cwd=work)
-daemon.reconcile("r", "o/r", "tok", {})
+sync.reconcile("r", "o/r", "tok", {})
 check("github fast-forwarded to buzz tip", tip(GITHUB) == new)
 check("silent on the happy path", POSTS == [])
 
@@ -107,7 +106,7 @@ work, base = scenario("github ahead")
 new = commit(work, "github work")
 sh("git", "push", "-q", GITHUB, "main:main", cwd=work)
 state = {}
-daemon.reconcile("r", "o/r", "tok", state)
+sync.reconcile("r", "o/r", "tok", state)
 check("buzz main NOT advanced", tip(BUZZ) == base)
 branches = subprocess.run(["git", "-C", BUZZ, "branch", "--list", "mirror/*"],
                           capture_output=True, text=True).stdout
@@ -118,7 +117,7 @@ check("named the deploy cost", any("frozen" in p for p in POSTS))
 
 # 3b. sticky: same state again -> no duplicate message
 POSTS.clear()
-daemon.reconcile("r", "o/r", "tok", state)
+sync.reconcile("r", "o/r", "tok", state)
 check("sticky: no repeat message on the next tick", POSTS == [])
 
 # 4. diverged -> halt, nothing pushed anywhere
@@ -129,7 +128,7 @@ sh("git", "reset", "-q", "--hard", base, cwd=work)
 g = commit(work, "github side")
 sh("git", "push", "-qf", GITHUB, "main:main", cwd=work)
 state = {}
-daemon.reconcile("r", "o/r", "tok", state)
+sync.reconcile("r", "o/r", "tok", state)
 check("buzz main untouched", tip(BUZZ) == b)
 check("github main untouched", tip(GITHUB) == g)
 check("halted as diverged", state["r"]["halted"] == "diverged")
@@ -138,68 +137,104 @@ check("said it needs a human", any("human" in p for p in POSTS))
 # 5. recovery clears the halt and says so
 POSTS.clear()
 sh("git", "push", "-qf", GITHUB, f"{b}:main", cwd=work)
-daemon.reconcile("r", "o/r", "tok", state)
+sync.reconcile("r", "o/r", "tok", state)
 check("halt cleared", not state["r"].get("halted"))
 check("announced recovery", any("recovered" in p for p in POSTS))
 
 # ---------------------------------------------------------------------------
-# multi-account installations
+# discovery
 #
-# An App set to "Any account" gets one installation PER account. A token minted
-# for one installation is not valid for another, so the mapping from repo owner
-# to token is the thing that has to be right.
+# What gets mirrored is derived, not configured, so the derivation is the part
+# that can silently mirror the wrong thing - or silently mirror nothing.
+#
+# An App set to "Any account" also gets one installation PER account, and a
+# token minted for one installation is not valid for another, so each repo has
+# to come back paired with its own account's token.
 # ---------------------------------------------------------------------------
 
-print("\n--- multi-account installations")
+print("\n--- discovery")
 
 API_CALLS = []
+
+GRANTS = {
+    11: ("irlfund", ["regenOS", "local-almanac", "agentic-engineering-infra"]),
+    22: ("gitcoinco", ["some-org-repo"]),
+    33: ("Lucian", []),
+    44: ("someone-else", ["their-private-thing"]),  # a stranger's install
+}
 
 
 def fake_api(path, token, method="GET", scheme="Bearer"):
     API_CALLS.append(path)
-    if path == "/app/installations":
-        return [
-            {"id": 11, "account": {"login": "irlfund"}},
-            {"id": 22, "account": {"login": "gitcoinco"}},
-            {"id": 33, "account": {"login": "Lucian"}},       # note the case
-            {"id": 44, "account": {"login": "someone-else"}},  # not ours
-        ]
+    base = path.split("?")[0]
+    # rsplit, not split: `per_page=100&page=1` contains "page=" twice.
+    page = int(path.rsplit("page=", 1)[1]) if "page=" in path else 1
+    if base == "/app/installations":
+        if page > 1:
+            return []
+        return [{"id": i, "account": {"login": a}} for i, (a, _) in GRANTS.items()]
+    if base == "/installation/repositories":
+        if page > 1:
+            return {"repositories": []}
+        acct, names = GRANTS[int(token.split("-")[1])]
+        return {"repositories": [{"name": n, "full_name": f"{acct}/{n}"} for n in names]}
     return {"token": "tok-" + path.split("/")[3]}
 
 
-daemon.app_jwt = lambda: "jwt"
-daemon.api = fake_api
+sync.app_jwt = lambda: "jwt"
+sync.api = fake_api
 
-tokens, missing = daemon.installation_tokens({"irlfund", "gitcoinco", "lucian"})
-check("one token per account", len(tokens) == 3)
-check("irlfund -> its own installation", tokens["irlfund"] == "tok-11")
-check("gitcoinco -> its own installation", tokens["gitcoinco"] == "tok-22")
-check("account matching is case-insensitive", tokens["lucian"] == "tok-33")
-check("nothing missing", missing == [])
-check("no token minted for accounts we do not mirror",
-      "/app/installations/44/access_tokens" not in API_CALLS)
+gh = sync.discover_github()
+check("every granted repo is found", len(gh) == 5)
+check("repos are keyed case-insensitively", "irlfund/regenos" in gh)
+check("the real casing is preserved for the URL",
+      gh["irlfund/regenos"][0] == "irlfund/regenOS")
+check("each repo carries its own installation's token",
+      gh["irlfund/regenos"][1] == "tok-11" and gh["gitcoinco/some-org-repo"][1] == "tok-22")
 
-tokens, missing = daemon.installation_tokens({"irlfund", "not-installed-org"})
-check("uninstalled account reported, not raised", missing == ["not-installed-org"])
-check("other accounts still usable", tokens["irlfund"] == "tok-11")
+# The Buzz announcement declares the pairing. Two of the three real repos have
+# a buzz repo-id that does NOT match the GitHub name, which is exactly why this
+# is read rather than guessed.
+BUZZ_REPOS = [
+    {"tags": [["d", "regenos-dev"], ["web", "https://github.com/irlfund/regenOS"]]},
+    {"tags": [["d", "local-almanac-mirror"],
+              ["web", "https://github.com/irlfund/local-almanac.git"]]},
+    {"tags": [["d", "agentic-engineering-infra"],
+              ["web", "https://github.com/irlfund/agentic-engineering-infra/"]]},
+    {"tags": [["d", "not-on-github"]]},                                  # no web tag
+    {"tags": [["d", "elsewhere"], ["web", "https://gitlab.com/x/y"]]},   # not GitHub
+    {"tags": [["d", "buzz-only"], ["web", "https://github.com/irlfund/never-granted"]]},
+]
+sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS)
 
-# A repo whose account has no installation halts with its own reason, and does
-# not take the other repos down with it.
-daemon.REPOS = {"good": "irlfund/regenOS", "bad": "nope-org/thing"}
-daemon.reconcile = lambda repo_id, gh, tok, st: st.update({repo_id: {"ok": tok}})
-daemon.load_state = lambda: {}
-saved = {}
-daemon.save_state = lambda s: saved.update(s)
-daemon.touch_last_success = lambda: saved.update({"_touched": True})
-POSTS.clear()
-daemon.tick()
-check("uninstalled repo halts as github-not-installed",
-      saved.get("bad", {}).get("halted") == "github-not-installed")
-check("healthy repo still reconciled with its own account's token",
-      saved.get("good", {}).get("ok") == "tok-11")
-check("last-success NOT touched while a repo is halted", "_touched" not in saved)
-check("halt message names the account to install on",
-      any("nope-org" in p for p in POSTS))
+bz = sync.discover_buzz()
+check("pairing is read off the announcement, not guessed from the name",
+      bz["regenos-dev"] == "irlfund/regenOS")
+check("a trailing .git does not change the pairing",
+      bz["local-almanac-mirror"] == "irlfund/local-almanac")
+check("a trailing slash does not change the pairing",
+      bz["agentic-engineering-infra"] == "irlfund/agentic-engineering-infra")
+check("a repo with no web tag is not a candidate", "not-on-github" not in bz)
+check("a non-GitHub web tag is not a candidate", "elsewhere" not in bz)
+
+pairs = sync.discover()
+got = {r: g for r, g, _ in pairs}
+check("mirrors exactly the repos that opted in on both sides",
+      got == {"regenos-dev": "irlfund/regenOS",
+              "local-almanac-mirror": "irlfund/local-almanac",
+              "agentic-engineering-infra": "irlfund/agentic-engineering-infra"})
+check("announced but never granted is skipped, not mirrored", "buzz-only" not in got)
+check("a stranger's installation cannot inject a repo",
+      not any(g.startswith("someone-else/") for g in got.values()))
+check("granted but not announced is skipped",
+      "some-org-repo" not in " ".join(got.values()))
+check("each pair carries its own account's token",
+      all(t == "tok-11" for _, _, t in pairs))
+
+sync.ONLY = {"regenos-dev"}
+check("MIRROR_ONLY restricts to the named repos",
+      [r for r, _, _ in sync.discover()] == ["regenos-dev"])
+sync.ONLY = set()
 
 
 # ---------------------------------------------------------------------------
@@ -208,20 +243,44 @@ check("halt message names the account to install on",
 
 print("\n--- --once exit status")
 
-daemon.REPOS = {"good": "irlfund/regenOS"}
-daemon.reconcile = lambda repo_id, gh, tok, st: None
-daemon.load_state = lambda: {}
-daemon.save_state = lambda s: None
+sync.reconcile = lambda repo_id, gh_repo, tok, st: None
+sync.load_state = lambda: {}
+sync.save_state = lambda s: None
 touched = []
-daemon.touch_last_success = lambda: touched.append(1)
-sys.argv = ["daemon.py", "--once"]
-check("clean run exits 0", daemon.main() == 0)
+sync.touch_last_success = lambda: touched.append(1)
+sys.argv = ["sync.py", "--once"]
+check("clean run exits 0", sync.main() == 0)
 check("clean run recorded success", len(touched) == 1)
 
-daemon.REPOS = {"bad": "nope-org/thing"}
+
+def boom(repo_id, gh_repo, tok, st):
+    raise RuntimeError("api.github.com exploded")
+
+
+sync.reconcile = boom
 POSTS.clear(); touched.clear()
-check("failed run exits non-zero", daemon.main() == 1)
+check("failed run exits non-zero", sync.main() == 1)
 check("failed run did NOT record success", touched == [])
+check("failure is attributed to github", any("github-auth-failed" in p for p in POSTS))
+
+# Discovering nothing must fail loudly: an empty mirror set reads exactly like
+# "everything is in sync", and it is the shape a mis-click produces.
+sync.reconcile = lambda repo_id, gh_repo, tok, st: None
+sync.discover = lambda: []
+touched.clear()
+check("discovering no repos exits non-zero", sync.main() == 1)
+check("discovering no repos did NOT record success", touched == [])
+
+# Concurrency: Coolify does not dedupe scheduled runs, so an overlapping exec
+# must be a no-op rather than two runs racing on the same bare clones.
+sync.discover = lambda: [("r", "o/r", "tok")]
+held = sync.hold_lock()
+check("a second run cannot take the lock", sync.hold_lock() is None)
+touched.clear()
+check("an overlapping run exits 0, not as a failure", sync.main() == 0)
+check("an overlapping run did no work", touched == [])
+held.close()
+check("the lock is released when the holder exits", sync.hold_lock() is not None)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nFAILED" if FAILED else "\nall passed")

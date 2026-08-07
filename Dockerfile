@@ -1,4 +1,4 @@
-# buzz-mirror-daemon
+# buzz-mirror
 #
 # Two binaries have to come from the buzz workspace and are pinned to one
 # commit, so a bad upstream change cannot silently alter auth behaviour:
@@ -45,9 +45,10 @@ RUN chmod +x /app/mirror/entrypoint.sh /app/mirror/healthcheck.sh
 USER mirror
 VOLUME /var/lib/git-mirror
 
-# Interval-derived: three missed ticks before unhealthy. Coolify restarts on
-# unhealthy, which converts "wedged but running" into something visible.
-HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
-    CMD /app/mirror/healthcheck.sh
+# No HEALTHCHECK: it is mode-specific, not image-specific. Under the deployed
+# shape the container's main process is `sleep infinity` and the reconcile is a
+# scheduled task, so restarting the container fixes nothing and a failed run
+# already alerts on its own exit status. healthcheck.sh ships anyway - loop mode
+# needs it, and docs/MIRROR.md says how to wire it up there.
 
 ENTRYPOINT ["/app/mirror/entrypoint.sh"]

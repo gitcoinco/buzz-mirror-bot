@@ -1,16 +1,22 @@
 #!/bin/sh
-# Staleness check on the daemon's last fully-successful tick.
+# Staleness check on the last fully-successful tick.
 #
-# Used in two places, deliberately the same script:
-#   1. the container HEALTHCHECK  -> Coolify restarts a wedged-but-running daemon
+# LOOP MODE ONLY. Under the deployed shape - `sync.py --once` as a Coolify
+# scheduled task - this is unnecessary: the run's own exit status is the alert,
+# and a missing container fails the exec the same way. It is not wired into the
+# image; see docs/MIRROR.md for how to add it back if you run the loop.
+#
+# It exists because a wedged long-running process never exits to be noticed. Use
+# it in two places, deliberately the same script:
+#   1. the container HEALTHCHECK  -> Coolify restarts a wedged-but-running loop
 #   2. a Coolify scheduled task   -> Coolify fires "Scheduled Task Failure",
 #                                    which is the out-of-band alert path
 #
-# (2) is the one that matters. An alert emitted by the daemon itself dies with
-# the daemon, and the sharpest wedge mode - the Buzz key being dropped from a
-# channel - takes out the daemon's ability to post at the same moment it takes
-# out its ability to fetch. This check runs in a different process, on a
-# different schedule, and alerts through Coolify rather than through Buzz.
+# (2) is the one that matters. An alert emitted by the mirror itself dies with
+# it, and the sharpest wedge mode - the Buzz key being dropped from a channel -
+# takes out its ability to post at the same moment it takes out its ability to
+# fetch. This check runs in a different process, on a different schedule, and
+# alerts through Coolify rather than through Buzz.
 #
 # Exit 0 = fresh, exit 1 = stale. Nothing else.
 #
