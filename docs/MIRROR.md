@@ -181,9 +181,52 @@ as a pure latency optimisation without touching the decision tree.
 
 ## Deploying
 
-Create it as a Coolify application from `docker-compose.yml`, then `tofu import` it when the
-OpenTofu migration reaches it — the `coolify-terraform/coolify` provider supports import on every
-stateful resource, so building it in the UI now costs no rework later.
+The Coolify application does not exist until you create it. `docker-compose.yml` is its
+definition: Coolify treats a compose file as [the single source of
+truth](https://coolify.io/docs/knowledge-base/docker/compose) — it parses every `${VAR}` into a UI
+field, and the `${VAR:?}` ones block deploy until filled. The file is the form.
+
+**Source must be GitHub.** Coolify cannot clone from Buzz: Buzz git authenticates with NIP-98 via
+`git-credential-nostr` and Coolify has no such helper. This is the same reason GitHub `main` sits
+upstream of production. So whatever you deploy has to reach GitHub `main` first.
+
+**+ New → Public Repository**
+
+| field | value |
+|---|---|
+| Repository URL | `https://github.com/gitcoinco/buzz-mirror-bot` |
+| Branch | `main` |
+| Build Pack | Docker Compose |
+| Compose file location | `/docker-compose.yml` |
+
+Fill the four required environment variables — `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`,
+`GITHUB_APP_ID`, `GITHUB_APP_PEM_B64` — and deploy. The container comes up running
+`sleep infinity` and does nothing; that is correct, it is only an exec target.
+
+Then **Scheduled Tasks → + Add**:
+
+| field | value |
+|---|---|
+| Name | `mirror` |
+| Command | `/app/mirror/entrypoint.sh --once` |
+| Frequency | `*/5 * * * *` |
+
+If it asks for a container name, that is the compose service name: `mirror`.
+
+Finally, **Team → Notifications → Scheduled Task Failure** must be enabled on a channel someone
+reads. Without it the alerting design here is inert.
+
+`tofu import` it when the OpenTofu migration reaches it — the `coolify-terraform/coolify` provider
+supports import on every stateful resource, so building it in the UI now costs no rework later.
+
+### Do not let the mirror mirror itself
+
+Coolify deploys this repo from GitHub, and GitHub would be fed by the mirror. If the mirror breaks,
+a fix pushed to Buzz cannot reach GitHub, so it cannot deploy, so it stays broken.
+
+**Keep `.github/workflows/buzz-mirror-main.yml` on `buzz-mirror-bot` specifically.** Everywhere
+else it is exactly the per-repo cost this replaces and should be deleted once the mirror is proven.
+Here it is not redundancy — it is the only thing that breaks the deadlock.
 
 ### Configuration
 
