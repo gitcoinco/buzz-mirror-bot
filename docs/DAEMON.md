@@ -108,7 +108,7 @@ stateful resource, so building it in the UI now costs no rework later.
 | `BUZZ_PRIVATE_KEY` | mirror-bot's nostr key. Must be a member of every bound channel |
 | `BUZZ_AUTH_TAG` | NIP-OA owner attestation |
 | `GITHUB_APP_ID` | the App's id |
-| `GITHUB_APP_PEM` | the App private key |
+| `GITHUB_APP_PEM_B64` | the App private key, base64 (`base64 -w0 key.pem`) |
 | `BUZZ_REPO_OWNER` | 64-char hex pubkey that announced the repos |
 | `MIRROR_REPOS` | JSON, `{"<buzz-repo-id>": "<owner>/<repo>"}` |
 | `MIRROR_ALERT_CHANNEL` | channel UUID for halt and recovery messages |
@@ -121,6 +121,12 @@ The PEM arrives as an environment variable and the entrypoint moves it to a `040
 before starting the daemon. That is weaker than systemd's `LoadCredential`, since it transits an
 env var on the way in; it is the accepted cost of deploying through Coolify rather than as a host
 unit.
+
+Use **`GITHUB_APP_PEM_B64`**. A PEM is multi-line and secret-store form fields are not, so a raw
+paste is the most likely setup mistake there is. `GITHUB_APP_PEM` is also accepted for a
+single-line value with literal `\n` escapes; both paths normalise to the same bytes. The
+entrypoint checks for `BEGIN`/`END` markers and refuses to start on a mangled value rather than
+failing later with an opaque JWT error.
 
 ### GitHub App permissions
 

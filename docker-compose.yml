@@ -25,7 +25,11 @@ services:
       # a 0400 tmpfs file immediately - see entrypoint.sh for why that is a
       # compromise rather than a solution.
       GITHUB_APP_ID: ${GITHUB_APP_ID:?}
-      GITHUB_APP_PEM: ${GITHUB_APP_PEM:?}
+      # base64 of the .pem. Preferred over GITHUB_APP_PEM because a PEM is
+      # multi-line and Coolify's env var field is not: base64 survives the form
+      # with no escaping question. Generate with:
+      #   base64 -w0 your-app.private-key.pem
+      GITHUB_APP_PEM_B64: ${GITHUB_APP_PEM_B64:?}
 
       # --- what to mirror -----------------------------------------------
       BUZZ_REPO_OWNER: 20498bf7727e4c607731692863a5c8bcc0aca892272be392cb05758f45d92c1d
