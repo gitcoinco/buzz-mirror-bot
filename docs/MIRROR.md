@@ -92,6 +92,17 @@ skipped, granted to the App but not announced on buzz: gitcoinco/some-org-repo
 Discovering **zero** repos exits non-zero. An empty mirror set is never intended, and staying
 quiet about it would read exactly like "everything is in sync".
 
+Two Buzz repos naming the **same** GitHub repo in their `web` tags is the one pairing problem that
+does fail the run. They would take turns fast-forwarding one GitHub `main` from unrelated
+histories, and there is no safe guess about which is authoritative, so both are dropped:
+
+```
+ERROR irlfund/regenos is claimed by 2 buzz repos (regenos-dev, regenos-dupe) - skipping all of
+them; fix the `web` tags so each points at its own repo
+```
+
+Everything else still mirrors — one bad `web` tag should not stop the rest.
+
 `MIRROR_ONLY` (a JSON array of buzz repo-ids) restricts the set further. It exists to point a
 test deployment at one scratch repo; leave it unset in production.
 
