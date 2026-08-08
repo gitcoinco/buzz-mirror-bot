@@ -267,12 +267,29 @@ def discover():
     and halting on it would alert forever. Logging both directions every run is
     what keeps a mis-click visible instead of silent.
 
-    Returns [(repo_id, owner/name, token)].
+    Two Buzz repos pointing at the *same* GitHub repo is different: they would
+    take turns fast-forwarding one GitHub main from unrelated histories, so the
+    mirror would thrash forever and the repo would effectively be corrupt. There
+    is no safe guess about which is authoritative, so both are dropped and the
+    run fails.
+
+    Returns ([(repo_id, owner/name, token)], ok).
     """
     gh, bz = discover_github(), discover_buzz()
+
+    # Collisions are resolved before anything is mirrored, not while iterating:
+    # dropping the second one seen would make the winner depend on sort order.
+    claims = {}
+    for repo_id, gh_repo in sorted(bz.items()):
+        claims.setdefault(gh_repo.lower(), []).append(repo_id)
+    contested = {k: v for k, v in claims.items() if len(v) > 1}
+
+    ok = True
     pairs, ungranted = [], []
     for repo_id, gh_repo in sorted(bz.items()):
         if ONLY and repo_id not in ONLY:
+            continue
+        if gh_repo.lower() in contested:
             continue
         hit = gh.get(gh_repo.lower())
         if hit:
@@ -280,6 +297,11 @@ def discover():
             log(f"mirroring {repo_id} -> {hit[0]}")
         else:
             ungranted.append(f"{repo_id} -> {gh_repo}")
+
+    for gh_repo, ids in sorted(contested.items()):
+        ok = False
+        log(f"ERROR {gh_repo} is claimed by {len(ids)} buzz repos ({', '.join(ids)}) - "
+            f"skipping all of them; fix the `web` tags so each points at its own repo")
 
     if ungranted:
         log("skipped, announced on buzz but the App is not granted them: "
@@ -291,7 +313,7 @@ def discover():
             + ", ".join(unannounced))
     for missing in sorted(ONLY - set(bz)):
         log(f"WARN MIRROR_ONLY names {missing}, which has no buzz announcement")
-    return pairs
+    return pairs, ok
 
 
 # --------------------------------------------------------------------------
@@ -468,13 +490,12 @@ def tick():
     # expire in an hour anyway, so the listing is nearly free on top, and a repo
     # ticked in GitHub's UI should start mirroring on the next run with no
     # restart.
-    pairs = discover()
+    pairs, ok = discover()
     if not pairs:
         # Never intended in a working deployment, and silence would read exactly
         # like "everything is in sync". Loud on purpose.
         log("ERROR no repos to mirror - check the App's grants and the `web` tags")
         return False
-    ok = True
     for repo_id, gh_repo, token in pairs:
         try:
             reconcile(repo_id, gh_repo, token, state)

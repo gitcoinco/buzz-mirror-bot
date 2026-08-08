@@ -217,8 +217,9 @@ check("a trailing slash does not change the pairing",
 check("a repo with no web tag is not a candidate", "not-on-github" not in bz)
 check("a non-GitHub web tag is not a candidate", "elsewhere" not in bz)
 
-pairs = sync.discover()
+pairs, ok = sync.discover()
 got = {r: g for r, g, _ in pairs}
+check("a clean discovery reports ok", ok)
 check("mirrors exactly the repos that opted in on both sides",
       got == {"regenos-dev": "irlfund/regenOS",
               "local-almanac-mirror": "irlfund/local-almanac",
@@ -233,8 +234,23 @@ check("each pair carries its own account's token",
 
 sync.ONLY = {"regenos-dev"}
 check("MIRROR_ONLY restricts to the named repos",
-      [r for r, _, _ in sync.discover()] == ["regenos-dev"])
+      [r for r, _, _ in sync.discover()[0]] == ["regenos-dev"])
 sync.ONLY = set()
+
+# Two buzz repos claiming one GitHub repo would take turns fast-forwarding the
+# same main from unrelated histories. There is no safe guess about which wins,
+# so both are dropped and the run fails rather than thrashing quietly.
+CONTESTED = BUZZ_REPOS + [
+    {"tags": [["d", "regenos-dupe"], ["web", "https://github.com/irlfund/regenOS"]]},
+]
+sync.buzz_cli = lambda *a: json.dumps(CONTESTED)
+pairs, ok = sync.discover()
+names = [r for r, _, _ in pairs]
+check("a contested GitHub repo fails the run", not ok)
+check("both claimants are dropped, not just the loser",
+      "regenos-dev" not in names and "regenos-dupe" not in names)
+check("uncontested repos still mirror", "local-almanac-mirror" in names)
+sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS)
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +282,14 @@ check("failure is attributed to github", any("github-auth-failed" in p for p in 
 # Discovering nothing must fail loudly: an empty mirror set reads exactly like
 # "everything is in sync", and it is the shape a mis-click produces.
 sync.reconcile = lambda repo_id, gh_repo, tok, st: None
-sync.discover = lambda: []
+sync.discover = lambda: ([], True)
 touched.clear()
 check("discovering no repos exits non-zero", sync.main() == 1)
 check("discovering no repos did NOT record success", touched == [])
 
 # Concurrency: Coolify does not dedupe scheduled runs, so an overlapping exec
 # must be a no-op rather than two runs racing on the same bare clones.
-sync.discover = lambda: [("r", "o/r", "tok")]
+sync.discover = lambda: ([("r", "o/r", "tok")], True)
 held = sync.hold_lock()
 check("a second run cannot take the lock", sync.hold_lock() is None)
 touched.clear()
