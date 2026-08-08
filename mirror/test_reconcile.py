@@ -101,21 +101,49 @@ sync.reconcile("r", "o/r", "tok", {})
 check("github fast-forwarded to buzz tip", tip(GITHUB) == new)
 check("silent on the happy path", POSTS == [])
 
-# 3. github ahead -> propose only; buzz main untouched
+# 3. github ahead -> adopt it onto buzz main. A strict ancestor is an update,
+#    not a conflict, so this is the same non-force push as the other direction.
 work, base = scenario("github ahead")
 new = commit(work, "github work")
 sh("git", "push", "-q", GITHUB, "main:main", cwd=work)
 state = {}
 sync.reconcile("r", "o/r", "tok", state)
-check("buzz main NOT advanced", tip(BUZZ) == base)
+check("buzz main fast-forwarded to github tip", tip(BUZZ) == new)
+check("not halted", not state.get("r", {}).get("halted"))
+check("said which way it went", any("from GitHub" in p for p in POSTS))
 branches = subprocess.run(["git", "-C", BUZZ, "branch", "--list", "mirror/*"],
                           capture_output=True, text=True).stdout
-check("proposal branch pushed to buzz", f"github-ahead-{new[:7]}" in branches)
+check("no proposal branch was needed", branches.strip() == "")
+
+# 3b. adopting converges the tips, so the next tick is silent - the notice is
+#     one per adopted push, not one per tick.
+POSTS.clear()
+sync.reconcile("r", "o/r", "tok", state)
+check("nothing more to say once the tips match", POSTS == [])
+
+# 3c. protection is per-repo: where the relay refuses the push to main, the
+#     propose-only path still runs. No flag day, and a repo that should never be
+#     written from GitHub simply keeps `push:owner`.
+work, base = scenario("github ahead, buzz main not writable")
+with open(os.path.join(BUZZ, "hooks", "pre-receive"), "w") as f:
+    f.write('#!/bin/sh\nwhile read o n ref; do\n'
+            '  [ "$ref" = refs/heads/main ] && { echo "requires Owner role" >&2; exit 1; }\n'
+            'done\nexit 0\n')
+os.chmod(os.path.join(BUZZ, "hooks", "pre-receive"), 0o755)
+new = commit(work, "github work")
+sh("git", "push", "-q", GITHUB, "main:main", cwd=work)
+state = {}
+sync.reconcile("r", "o/r", "tok", state)
+check("buzz main NOT advanced when the push is refused", tip(BUZZ) == base)
+branches = subprocess.run(["git", "-C", BUZZ, "branch", "--list", "mirror/*"],
+                          capture_output=True, text=True).stdout
+check("fell back to a proposal branch", f"github-ahead-{new[:7]}" in branches)
 check("halted as github-ahead", state["r"]["halted"] == "github-ahead")
 check("posted the merge command", any(f"git push buzz {new}" in p for p in POSTS))
 check("named the deploy cost", any("frozen" in p for p in POSTS))
 
-# 3b. sticky: same state again -> no duplicate message
+# 3d. the fallback is sticky on the proposed sha, or a repo that stays ahead
+#     would alert on every tick.
 POSTS.clear()
 sync.reconcile("r", "o/r", "tok", state)
 check("sticky: no repeat message on the next tick", POSTS == [])

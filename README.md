@@ -22,7 +22,7 @@ mirrored repo*, which does not scale.
 | adding a repo | commit + secrets | tick the repo in the App's install UI |
 | GitHub write credential | none — uses `GITHUB_TOKEN` | a GitHub App key, off-platform |
 | latency | ~10 min | your cron interval |
-| GitHub ahead | fails red | proposes a branch + PR, halts |
+| GitHub ahead | fails red | fast-forwards Buzz to it, or proposes a branch + PR where Buzz `main` is not writable |
 
 The Action's one real advantage is that no GitHub write credential exists anywhere:
 
@@ -44,13 +44,18 @@ up in exchange for scaling: it holds a GitHub App key that can write the repos i
 
 ## Properties
 
-- **One-way.** Buzz → GitHub. GitHub `main` is never the source of truth here.
-- **Fast-forward only.** The push is plain and non-force, so it cannot rewrite history. If the
-  two `main`s diverge, the job fails loudly and asks a human to reconcile.
+- **Buzz-first, not Buzz-only.** Buzz → GitHub is the normal direction. The mirror will also
+  fast-forward Buzz to GitHub's tip when GitHub is strictly ahead, because that is an update
+  rather than a conflict; see [`docs/MIRROR.md`](docs/MIRROR.md) for what that costs. The Action
+  is one-way and stays that way.
+- **Fast-forward only.** Every push is plain and non-force, so nothing here can rewrite history
+  in either direction. If the two `main`s genuinely diverge, it halts and asks a human.
 - **`main` only.** Other branches stay on Buzz.
 - **Least-privilege identity.** `mirror-bot` is a distinct nostr key added to the repo's bound
   channel as a `bot`, carrying a NIP-OA attestation from its owner. Buzz-side branch protection
-  (`push:owner`) keeps it off `main` there.
+  is what bounds it: `push:member` lets it fast-forward `main` and nothing else, and the relay's
+  unweakenable defaults keep force-push and delete at Admin. A repo that should never be written
+  from GitHub keeps `push:owner`, and the mirror proposes instead.
 
 ## Layout
 

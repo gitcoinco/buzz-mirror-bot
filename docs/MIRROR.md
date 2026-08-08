@@ -18,29 +18,55 @@ Per repo, per run, it fetches both `main`s into a bare clone and compares them:
 |---|---|
 | tips equal | nothing; clear any halt |
 | GitHub is an ancestor of Buzz | fast-forward GitHub to Buzz's tip |
-| Buzz is an ancestor of GitHub | **propose only** — see below |
+| Buzz is an ancestor of GitHub | fast-forward Buzz to GitHub's tip — see below |
 | neither | halt as `diverged`; a human reconciles |
 
 Every push is plain and non-force. Nothing here can rewrite history on either side; the worst
 outcome is that a repo stops mirroring and says so.
 
-### GitHub ahead is the error case, and it is propose-only
+### GitHub ahead is an update, not an error
 
-The mirror never pushes GitHub's tip onto Buzz `main`. It pushes it to
-`mirror/github-ahead-<sha>`, opens a NIP-34 PR, and posts the one-line command to adopt it:
+A strict ancestor is a fast-forward in either direction, and adopting one needs no judgement.
+So the mirror adopts it and posts a line saying it did:
+
+> `agentic-engineering-infra`: Buzz main fast-forwarded to `12082eb` from GitHub
+> (`irlfund/agentic-engineering-infra`). Nothing was rewritten.
+
+This is a change from the original design, which proposed a branch and halted. The reason for
+the change is that halting on GitHub-ahead assumes **every** mirrored repo is developed
+Buzz-first. That is the intended habit, but it is not universally true — the infra repo is
+worked on GitHub-first on purpose — and such a repo would sit in a permanent halt that means
+nothing except "someone worked in the usual place for that repo". An alarm that fires forever
+is not an alarm. Real divergence still halts, and that is what the alarm was for.
+
+**What it costs.** GitHub write now reaches Buzz `main` with no review step. That set already
+reaches production directly — Coolify deploys from GitHub — so this grants it nothing it did not
+have. What is genuinely lost is the *nudge* toward working Buzz-first; the channel post is the
+replacement, visible rather than blocking.
+
+**What makes it possible.** `push:member` on `refs/heads/main` in the repo's `buzz-protect`
+tags. The relay takes `max(explicit push:role, default_min_role(ref, kind))`, and its built-in
+defaults on a branch are Member for a fast-forward, Admin for a non-fast-forward or a delete —
+and an explicit rule can never *weaken* the destructive two
+(`buzz-core/src/git_perms.rs`, `evaluate_ref_update` / `default_min_role`). So that one tag means
+exactly "mirror-bot may fast-forward `main` and nothing else". Ownership still matters for
+everything else: a NIP-OA auth tag grants *membership*, not push rights, and a channel `Bot`
+role is coerced to `Member` for git.
+
+### Where `main` is not writable, it still proposes
+
+Protection is per-repo, so this needed no flag day and a repo that should never be written from
+GitHub simply keeps `push:owner`. When the relay refuses the push, the mirror falls back to the
+original behaviour: it pushes GitHub's tip to `mirror/github-ahead-<sha>`, opens a NIP-34 PR,
+halts, and posts the one-line command to adopt it:
 
 ```sh
 git push buzz <github-sha>:refs/heads/main
 ```
 
-Two reasons, and both matter:
-
-- **It would invert the trust direction.** Buzz is origin. Auto-pushing GitHub's tip onto Buzz
-  `main` would make anyone with GitHub write into someone who can write Buzz `main`.
-- **It would not work anyway.** The relay resolves push role from repo ownership
-  (`is_agent_owner`) and channel role — a NIP-OA auth tag grants *membership*, not push rights,
-  and a channel `Bot` role is coerced to `Member` for git. So mirror-bot cannot push protected
-  `main`. It *can* create any unprotected ref, which is exactly what the proposal branch needs.
+The fallback is not matched on the relay's denial text — a transient network failure lands there
+too, and the proposal's own push fails the same way, which halts as a reconcile failure.
+Guessing which one it was would only add a way to guess wrong.
 
 There is no server-side merge on Buzz. `buzz pr status --status merged --merge-commit <sha>`
 takes the merge commit as an *input* — setting a PR merged records that you merged it. Since

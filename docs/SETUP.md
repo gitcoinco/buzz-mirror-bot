@@ -77,6 +77,13 @@ buzz repos protect list --id <repo>
 Rule vocabulary: `["buzz-protect", "<ref-pattern>", "<rule>", …]` where rule is
 `push:<owner|admin|member>`, `no-force-push`, `no-delete`, or `require-patch`.
 
+`push:member` is the one to reach for if you want the mirror to adopt a GitHub-ahead `main`
+automatically (see [`MIRROR.md`](MIRROR.md)). It is narrower than it sounds: the relay takes
+`max(explicit push:role, default_min_role(ref, kind))`, and the built-in defaults on a branch are
+Member for a fast-forward but Admin for a non-fast-forward or a delete — which an explicit rule
+can never weaken. So `push:member` + `no-force-push` + `no-delete` means "may fast-forward, may
+do nothing else". Keep `push:owner` on any repo that should never be written from GitHub.
+
 ### 4. Get the two histories connected — once, by hand
 
 **The mirror cannot bootstrap itself.** GitHub only exposes a workflow — both its

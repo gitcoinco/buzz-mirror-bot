@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
-"""buzz-mirror — fast-forward Buzz `main` onto GitHub `main`, one way.
+"""buzz-mirror — keep Buzz `main` and GitHub `main` on one line of history.
 
-Direction is **Buzz -> GitHub**. Buzz is origin; GitHub is a publish target that
-Coolify happens to deploy from. It never rewrites history in either
-direction: every push is a plain non-force push, and anything that is not a
-clean fast-forward halts that repo instead of guessing.
+Buzz is origin; GitHub is a publish target that Coolify happens to deploy from,
+so **Buzz -> GitHub is the normal direction**. It never rewrites history in
+either direction: every push is a plain non-force push, and anything that is not
+a clean fast-forward halts that repo instead of guessing.
 
-Three outcomes per repo per tick:
+Four outcomes per repo per tick:
 
   buzz == github          nothing to do
   github is ancestor      fast-forward GitHub to Buzz's tip
-  buzz is ancestor        GitHub is AHEAD - the error case. Push GitHub's tip to
-                          a `mirror/github-ahead-<sha>` branch on Buzz, open a
-                          Buzz PR, post the one-line command to merge it, halt.
+  buzz is ancestor        GitHub is ahead. Fast-forward *Buzz* to GitHub's tip
+                          and say so in the channel. If the relay refuses the
+                          push, fall back to proposing it (below).
   neither                 diverged. Halt and say so. No automatic resolution.
 
-The "GitHub ahead" path is deliberately **propose-only**. Pushing GitHub's tip
-onto Buzz `main` would make GitHub a write path into Buzz, and mirror-bot cannot
-push protected `main` anyway (the relay resolves push role from repo ownership
-and channel role - a NIP-OA auth tag grants membership, not push rights). Every
-other ref falls through to the Member default, which is why the proposal branch
-works with no permission change.
+A strict ancestor is not a conflict in either direction - it is an update, and
+adopting it needs no judgement. Reserving the alarm for *real* divergence is
+what keeps the alarm worth reading: a repo that is legitimately developed
+GitHub-first (the infra repo is) would otherwise sit in a permanent halt that
+means nothing except "someone worked in the usual place for that repo".
+
+Adopting the GitHub side does mean GitHub write reaches Buzz `main` with no
+review step. That set already reaches production directly - Coolify deploys from
+GitHub - so this grants it nothing it did not have. What is genuinely lost is
+the nudge toward working Buzz-first, and the channel post is the replacement:
+visible, not blocking.
+
+It needs `push:member` on `refs/heads/main` in the repo's `buzz-protect` tags.
+The relay takes `max(explicit push:role, default_min_role(ref, kind))` and its
+built-in default for a fast-forward on a branch is Member, while non-fast-forward
+and delete default to Admin and an explicit rule can never weaken them
+(`buzz-core/src/git_perms.rs`). So that one tag means "mirror-bot may
+fast-forward main and nothing else". Where it is *not* set the push is refused,
+and the propose-only path below still runs - so this needs no flag day, and a
+repo that should never be written from GitHub simply keeps `push:owner`.
 
 Halts are **sticky**: one message per halt, not one per tick, and the halt holds
 until the two tips converge. A halt freezes deploys for that repo, so the
@@ -442,6 +456,36 @@ def clear_halt(state, repo_id):
     save_state(state)
 
 
+def propose_github_ahead(d, repo_id, gh_repo, gh_tip, state):
+    """The fallback for a repo whose Buzz `main` this bot may not push.
+
+    Puts GitHub's tip on Buzz as a branch, opens a PR for it, and halts with the
+    one-line command a human runs to adopt it. Sticky on the proposed sha, so a
+    repo that stays ahead is one message rather than one per tick.
+
+    This was the only GitHub-ahead behaviour until `push:member` made adopting
+    it possible. It stays because protection is per-repo: a repo that should
+    never be written from GitHub keeps `push:owner` and lands here.
+    """
+    branch = f"mirror/github-ahead-{gh_tip[:7]}"
+    if state.get(repo_id, {}).get("proposed") == gh_tip:
+        return
+    git(d, "push", buzz_url(repo_id), f"{gh_tip}:refs/heads/{branch}")
+    link = open_pr(repo_id, branch, gh_tip, gh_repo)
+    state[repo_id] = {"halted": "github-ahead", "proposed": gh_tip,
+                      "since": int(time.time())}
+    save_state(state)
+    log(f"HALT {repo_id}: github-ahead at {gh_tip[:7]}")
+    post(
+        f"**GitHub is ahead of Buzz on `{repo_id}`, and this bot cannot push "
+        f"Buzz main here.**\n\n"
+        f"Pushed `{branch}` to Buzz. Fast-forward main to adopt it:\n\n"
+        f"```sh\ngit push buzz {gh_tip}:refs/heads/main\n```\n\n"
+        + (f"{link}\n\n" if link else "")
+        + "Deploys for this repo are frozen until this is resolved."
+    )
+
+
 def reconcile(repo_id, gh_repo, token, state):
     d = ensure_repo(repo_id)
     buzz_tip, gh_tip = fetch_both(d, repo_id, gh_repo, token)
@@ -460,23 +504,23 @@ def reconcile(repo_id, gh_repo, token, state):
         return
 
     if is_ancestor(d, buzz_tip, gh_tip):
-        # GitHub ahead: propose, never push to Buzz main.
-        branch = f"mirror/github-ahead-{gh_tip[:7]}"
-        prev = state.get(repo_id, {})
-        if prev.get("proposed") != gh_tip:
-            git(d, "push", buzz_url(repo_id), f"{gh_tip}:refs/heads/{branch}")
-            link = open_pr(repo_id, branch, gh_tip, gh_repo)
-            state[repo_id] = {"halted": "github-ahead", "proposed": gh_tip,
-                              "since": int(time.time())}
-            save_state(state)
-            log(f"HALT {repo_id}: github-ahead at {gh_tip[:7]}")
-            post(
-                f"**GitHub is ahead of Buzz on `{repo_id}`.**\n\n"
-                f"Pushed `{branch}` to Buzz. Fast-forward main to adopt it:\n\n"
-                f"```sh\ngit push buzz {gh_tip}:refs/heads/main\n```\n\n"
-                + (f"{link}\n\n" if link else "")
-                + "Deploys for this repo are frozen until this is resolved."
-            )
+        # GitHub ahead by a clean fast-forward: adopt it.
+        try:
+            git(d, "push", buzz_url(repo_id), f"{gh_tip}:refs/heads/main")
+        except RuntimeError as e:
+            # Almost always the relay refusing the push because this repo still
+            # has `push:owner` on main. Deliberately not matched on the denial
+            # text: a transient network failure lands here too, and the propose
+            # path's own push fails the same way, which halts as a reconcile
+            # failure. Guessing which one it was would only add a way to guess
+            # wrong.
+            log(f"{repo_id}: buzz main refused the fast-forward ({e}); proposing instead")
+            propose_github_ahead(d, repo_id, gh_repo, gh_tip, state)
+            return
+        log(f"{repo_id}: buzz {buzz_tip[:7]} -> {gh_tip[:7]} (adopted from github)")
+        post(f"`{repo_id}`: Buzz main fast-forwarded to `{gh_tip[:7]}` from GitHub "
+             f"(`{gh_repo}`). Nothing was rewritten.")
+        clear_halt(state, repo_id)
         return
 
     halt(state, repo_id, "diverged",
