@@ -243,22 +243,26 @@ as a pure latency optimisation without touching the decision tree.
 
 Everything installs on **infra-box**, as root. Nothing is a Coolify resource.
 
-1. `/etc/buzz-mirror/env`, `0600`, root-owned — see [Configuration](#configuration).
-2. `deploy/run-once.sh` and `deploy/alert.sh` → `/opt/buzz-mirror/`, `0700`.
-3. The three unit files → `/etc/systemd/system/`, then
-   `systemctl daemon-reload && systemctl enable --now buzz-mirror.timer`.
-4. `systemctl start buzz-mirror.service` once by hand and read the journal before trusting the
-   timer.
+The deploy side lives in **`agentic-engineering-infra`**, not here — units in `host/units/`, the
+two scripts in `host/`, wired into `host/install-fleet-units.sh`. That is the same split the fleet
+dispatcher uses: this repo is the program and its image, aei is how it runs. So installing is:
 
-**Steps 2 and 3 should not stay manual.** aei owns host plumbing through
-`host/install-fleet-units.sh` (units in `host/units/`, run by the converge, idempotent, and the
-recovery path after a box rebuild) — and its header states the rule directly: *"Tofu deliberately
-does NOT manage these: its providers speak Coolify and GitHub; host plumbing follows the repo's
-own 'idempotent scripts, not command history' contract."* So these units belong in aei
-`host/units/` and the two scripts in aei `host/`, exactly like `fleet-dispatch.service` and
-`fleet-dispatch.py`. This repo keeps what it is good for — the mirror program and its image.
-Only `/etc/buzz-mirror/env` stays hand-seeded, because it holds secrets and aei never templates
-credentials.
+```sh
+# on infra-box, as root
+/home/lucian/agentic-engineering-infra/host/install-fleet-units.sh infra-box
+```
+
+which is idempotent and is also the recovery path after a box rebuild.
+
+One thing stays hand-seeded, because aei never templates credentials:
+**`/etc/buzz-mirror/env`**, `0600`, root-owned — see [Configuration](#configuration). The
+installer deliberately leaves the timer stopped until that file exists, so a box without it does
+not fail a run every five minutes. Once seeded:
+
+```sh
+systemctl enable --now buzz-mirror.timer
+systemctl start buzz-mirror.service   # once by hand; read the journal before trusting the timer
+```
 
 **Both prerequisites now exist in the infra repo (`agentic-engineering-infra`, `dbffa83`):**
 
