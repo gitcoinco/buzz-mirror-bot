@@ -1,16 +1,25 @@
 #!/bin/sh
-# Move the GitHub App private key out of the environment and onto a tmpfs file
-# before anything else runs.
+# Get a GitHub credential into place, then run the mirror.
 #
-# Coolify delivers secrets as environment variables, and an env var is readable
-# from /proc/<pid>/environ by anything running as this user and shows up in any
-# accidental `env` dump. A 0400 file on tmpfs is the closest we get to systemd's
-# LoadCredential here. This is a real, accepted downside of deploying via
-# Coolify rather than a systemd unit: the key transits an env var on its way in.
+# The deployed shape supplies GITHUB_INSTALLATION_TOKEN: infra-box's issuer
+# holds the App's PEM and hands out installation tokens that expire in an hour.
+# Nothing to unpack, and no long-lived key is ever inside this container.
 #
-# Unsetting it after writing means the mirror process itself never carries it.
+# The PEM path below is the fallback for a deployment with no issuer - loop mode
+# somewhere else, or a laptop. There the key arrives as an env var, which is
+# readable from /proc/<pid>/environ by anything running as this user and shows
+# up in any accidental `env` dump, so it is moved to a 0400 tmpfs file and
+# unset. That is a mitigation, not a fix; prefer the token.
 
 set -eu
+
+if [ -n "${GITHUB_INSTALLATION_TOKEN:-}" ]; then
+    if [ -n "${BUZZ_PRIVATE_KEY:-}" ] && [ -z "${NOSTR_PRIVATE_KEY:-}" ]; then
+        NOSTR_PRIVATE_KEY="$BUZZ_PRIVATE_KEY"
+        export NOSTR_PRIVATE_KEY
+    fi
+    exec python3 /app/mirror/sync.py "$@"
+fi
 
 PEM_PATH="${GITHUB_APP_PEM_PATH:-/run/mirror/ghapp.pem}"
 
@@ -58,22 +67,10 @@ if [ -n "${BUZZ_PRIVATE_KEY:-}" ] && [ -z "${NOSTR_PRIVATE_KEY:-}" ]; then
     export NOSTR_PRIVATE_KEY
 fi
 
-# "$@" so the same image serves every mode. The deployed shape is:
+# "$@" so the same image serves both modes. The deployed shape is one container
+# per run - `docker run --rm <image> --once`, started by a systemd timer on
+# infra-box - so there is nothing to hold open and no exec target to keep alive.
 #
-#   main process    entrypoint.sh sleep infinity   (exists only to be exec'd into)
-#   scheduled task  entrypoint.sh --once           (the actual mirror run)
-#
-# `sleep infinity` looks pointless and is not: Coolify's scheduled tasks
-# `docker exec` into a *running* container rather than starting one, and Coolify
-# has no host-level cron, so something has to hold the container open. The
-# payoff is that one notification path covers both a failed run and a missing
-# container - if nothing is running, the exec fails too.
-#
-# `sleep` is not a python entrypoint, so dispatch on it explicitly.
-if [ "${1:-}" = "sleep" ]; then
-    exec "$@"
-fi
-
-# No args loops (for anywhere without a scheduler); `--once` runs a single
-# reconcile and exits non-zero on failure.
+# No args loops instead, for anywhere without a scheduler; `--once` runs a
+# single reconcile and exits non-zero on failure.
 exec python3 /app/mirror/sync.py "$@"

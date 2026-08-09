@@ -260,10 +260,19 @@ check("granted but not announced is skipped",
 check("each pair carries its own account's token",
       all(t == "tok-11" for _, _, t in pairs))
 
-sync.ONLY = {"regenos-dev"}
-check("MIRROR_ONLY restricts to the named repos",
-      [r for r, _, _ in sync.discover()[0]] == ["regenos-dev"])
-sync.ONLY = set()
+# The deployed shape gets an installation token from the issuer instead of the
+# PEM, and that token must be installation-WIDE: narrowing it to a repo list
+# would move enrolment out of the App grant and into the issuer's flags.
+API_CALLS.clear()
+sync.INSTALL_TOKEN = "tok-11"
+gh = sync.discover_github()
+check("a supplied token is used as-is", "/app/installations" not in " ".join(API_CALLS))
+check("no App JWT is minted when a token is supplied",
+      not any("access_tokens" in c for c in API_CALLS))
+check("the token's own grants are the mirror set",
+      sorted(v[0] for v in gh.values()) ==
+      ["irlfund/agentic-engineering-infra", "irlfund/local-almanac", "irlfund/regenOS"])
+sync.INSTALL_TOKEN = ""
 
 # Two buzz repos claiming one GitHub repo would take turns fast-forwarding the
 # same main from unrelated histories. There is no safe guess about which wins,

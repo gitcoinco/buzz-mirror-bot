@@ -20,8 +20,8 @@ mirrored repo*, which does not scale.
 |---|---|---|
 | per-repo cost | workflow file + 2 secrets | none |
 | adding a repo | commit + secrets | tick the repo in the App's install UI |
-| GitHub write credential | none — uses `GITHUB_TOKEN` | a GitHub App key, off-platform |
-| latency | ~10 min | your cron interval |
+| GitHub write credential | none — uses `GITHUB_TOKEN` | a GitHub App installation token, ~1h, minted per run |
+| latency | ~10 min | your timer interval |
 | GitHub ahead | fails red | fast-forwards Buzz to it, or proposes a branch + PR where Buzz `main` is not writable |
 
 The Action's one real advantage is that no GitHub write credential exists anywhere:
@@ -30,7 +30,9 @@ The Action's one real advantage is that no GitHub write credential exists anywhe
 > built-in `GITHUB_TOKEN`.
 
 Its only secret is a Buzz *read* key for a dedicated `mirror-bot` identity. The mirror gives that
-up in exchange for scaling: it holds a GitHub App key that can write the repos it is installed on.
+up in exchange for scaling: it can write the repos the App is installed on. It narrows the gap by
+not holding the App key — the PEM stays on infra-box behind a token issuer, and each run gets an
+installation token that expires in an hour.
 
 ```
   agent / human                 Buzz relay                    GitHub
@@ -64,7 +66,8 @@ up in exchange for scaling: it holds a GitHub App key that can write the repos i
 | `mirror/sync.py` | the mirror — one deployment, any number of repos |
 | `mirror/healthcheck.sh` | staleness check; loop mode only |
 | `mirror/test_reconcile.py` | ancestry cases, discovery and locking against real repos |
-| `Dockerfile`, `docker-compose.yml` | the Coolify application |
+| `Dockerfile` | the image; one container per run |
+| `deploy/` | the infra-box systemd timer, its `OnFailure` alert, and the two scripts they call |
 | `docs/MIRROR.md` | how the mirror works and why it is shaped this way |
 | `.github/workflows/buzz-mirror-main.yml` | the original Action — superseded by the mirror |
 | `docs/SETUP.md` | setup, and the sharp edges worth knowing first |

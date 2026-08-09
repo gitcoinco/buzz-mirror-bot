@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the Buzz/GitHub mirror every 5 minutes
+Documentation=https://github.com/gitcoinco/buzz-mirror-bot/blob/main/docs/MIRROR.md
+
+[Timer]
+OnCalendar=*:0/5
+# Do not all-fire on the same second as every other fleet timer.
+RandomizedDelaySec=30
+# Catch up on one missed run after a reboot rather than waiting for the next
+# slot. Only one - the mirror is idempotent, so a backlog has no meaning.
+Persistent=true
+Unit=buzz-mirror.service
+
+[Install]
+WantedBy=timers.target

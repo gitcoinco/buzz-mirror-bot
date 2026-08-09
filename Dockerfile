@@ -31,10 +31,11 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir "PyJWT[crypto]==2.10.1"
 
-# Non-root. The daemon holds a GitHub App key with contents+workflows write and
-# a Buzz identity with read on private repos; it has no reason to be root.
-# uid pinned, not auto-assigned: docker-compose has to name it in the tmpfs
-# mount options, and a mount whose uid does not match is silently unwritable.
+# Non-root. The mirror holds a GitHub credential with contents+workflows write
+# and a Buzz identity with read on private repos; it has no reason to be root.
+# uid pinned, not auto-assigned: a `--tmpfs` mount has to name it in its
+# options, and a mount whose uid does not match is silently unwritable. Only the
+# PEM fallback needs that mount; the deployed shape gets a token instead.
 RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin mirror \
  && mkdir -p /var/lib/git-mirror /run/mirror \
  && chown mirror:mirror /var/lib/git-mirror /run/mirror
@@ -45,10 +46,9 @@ RUN chmod +x /app/mirror/entrypoint.sh /app/mirror/healthcheck.sh
 USER mirror
 VOLUME /var/lib/git-mirror
 
-# No HEALTHCHECK: it is mode-specific, not image-specific. Under the deployed
-# shape the container's main process is `sleep infinity` and the reconcile is a
-# scheduled task, so restarting the container fixes nothing and a failed run
-# already alerts on its own exit status. healthcheck.sh ships anyway - loop mode
-# needs it, and docs/MIRROR.md says how to wire it up there.
+# No HEALTHCHECK: it is mode-specific, not image-specific. The deployed shape is
+# one container per run, which exits - there is nothing to be healthy. A failed
+# run alerts on its own exit status, via the unit's OnFailure. healthcheck.sh
+# ships anyway - loop mode needs it, and docs/MIRROR.md says how to wire it up.
 
 ENTRYPOINT ["/app/mirror/entrypoint.sh"]

@@ -46,26 +46,32 @@ a GitHub `web` tag, and that same repo granted to the GitHub App. Adding a repo
 is a tick in GitHub's install UI - not an env var edit and a redeploy, which is
 exactly the per-repo cost this whole thing exists to remove.
 
+The App grant is the *enrolment act*, and it is not divisible: granted means
+fully enrolled, so the mirror pushes the repo and the fleet's dispatcher builds
+it. Those are two halves of one pipeline rather than two things to opt into
+separately, which is why there is no allowlist here to narrow the set with.
+
 Every tick is self-contained - state lives in state.json and the bare clones on
-the volume, never in memory - so this runs either as a **Coolify scheduled task**
-(`--once`, preferred) or as a long-running loop. Prefer `--once`: the run's own
-exit status is the alert, and Coolify's Scheduled Task Failure notification fires
-on it directly. No last-success file, no staleness probe, no second task watching
-the first.
+the volume, never in memory - so nothing needs a process to stay alive. The
+deployed shape is one container per run: a **systemd timer on infra-box** runs
+`docker run --rm <image> --once` every five minutes (`deploy/`). The run's own
+exit status is the alert, via the unit's `OnFailure=`.
 
-Coolify scheduled tasks `docker exec` into an already-running container
-(`ScheduledTaskJob.php`: `docker exec {$containerName} sh -c '...'`) - they do
-not start one, and Coolify has no host-level cron at all. So `--once` still needs
-a container that stays up; the deployment runs `sleep infinity` as its main
-process purely to be a target for the exec. Silly-looking, and worth it: a
-non-zero exit is written as `status => 'failed'` and sends the team a `TaskFailed`
-notification, and if the container is gone the exec itself fails the same way. So
-one path alerts on both "the mirror broke" and "the mirror is not there".
+Two things follow from running there rather than as a Coolify application. The
+token issuer is local, so the mirror is handed an installation token that
+expires in an hour instead of carrying the App's PEM - see discover_github().
+And systemd will not start a second instance of a unit that is already active,
+so overlapping runs cannot happen; the flock below stays anyway, because a
+hand-run `docker run` alongside a timed one still can.
 
-The loop mode exists for when no scheduler is available. It needs more: a
-`last-success` file, `healthcheck.sh`, and a separate staleness task - because a
-wedged long-running process never exits to be noticed, and an alert that shares
-a process with the thing it watches is not an alert.
+A timer that stops firing produces no failure to hook, so `OnFailure=` cannot
+see it. That is what `last-success` is for: fleet-audit asserts on its age from
+outside this process, which is the only place an alert about a dead mirror can
+honestly live.
+
+The loop mode exists for anywhere without a scheduler. It needs more: the same
+`last-success` file, `healthcheck.sh`, and a separate staleness check - because
+a wedged long-running process never exits to be noticed.
 
 Why polling and not the kind:30618 ref-state subscription: the relay does emit a
 ref-state event on every push, and subscribing would cut latency from ~60s to
@@ -96,27 +102,33 @@ LAST_SUCCESS = os.path.join(STATE_DIR, "last-success")
 
 INTERVAL = int(os.environ.get("MIRROR_INTERVAL_SECS", "60"))
 CHANNEL = os.environ["MIRROR_ALERT_CHANNEL"]
+# Only needed on the PEM path; a deployment with an issuer sets neither.
 PEM_PATH = os.environ.get("GITHUB_APP_PEM_PATH", "/run/mirror/ghapp.pem")
-APP_ID = os.environ["GITHUB_APP_ID"]
+APP_ID = os.environ.get("GITHUB_APP_ID", "")
 
 BUZZ_OWNER = os.environ["BUZZ_REPO_OWNER"]
 
-# Optional allowlist of buzz repo-ids, for pointing a test deployment at one
-# scratch repo. Unset means "everything discovery finds", which is the intended
-# steady state - this is an escape hatch, not configuration.
-ONLY = set(json.loads(os.environ.get("MIRROR_ONLY", "[]")))
+# An installation token from the issuer on infra-box, if the deployment has one.
+# Preferred over the PEM: the mirror then holds a credential that expires in an
+# hour instead of one that does not expire at all. It must be
+# installation-WIDE, not narrowed to a repo list - see discover_github().
+INSTALL_TOKEN = os.environ.get("GITHUB_INSTALLATION_TOKEN", "")
 
-if os.environ.get("MIRROR_REPOS"):
-    # Fail rather than ignore it: silently dropping a var that used to decide
-    # what gets mirrored is the kind of upgrade that looks fine for a week.
-    raise SystemExit(
-        "MIRROR_REPOS is gone - repos are discovered from the Buzz announcement's "
-        "`web` tag plus the GitHub App's grants. Use MIRROR_ONLY to restrict."
-    )
+for gone, why in (
+    ("MIRROR_REPOS", "repos are discovered from the Buzz announcement's `web` tag "
+                     "plus the GitHub App's grants"),
+    ("MIRROR_ONLY", "enrolment is the App grant and nothing else: granted means "
+                    "fully enrolled, in both directions. To mirror one scratch "
+                    "repo, grant the App one scratch repo"),
+):
+    # Fail rather than ignore: silently dropping a var that used to decide what
+    # gets mirrored is the kind of upgrade that looks fine for a week.
+    if os.environ.get(gone):
+        raise SystemExit(f"{gone} is gone - {why}.")
 
 
 def log(msg):
-    """Unbuffered stdout - Coolify's log view is the only place these land."""
+    """Unbuffered stdout - it is the run's journal entry and nothing else."""
     print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}", flush=True)
 
 
@@ -164,6 +176,11 @@ def touch_last_success():
 def app_jwt():
     """Sign the App assertion. `iat` is backdated 60s because GitHub rejects a
     JWT whose iat is in the future, and container clocks drift."""
+    if not APP_ID:
+        raise RuntimeError(
+            "no GitHub credential: set GITHUB_INSTALLATION_TOKEN (from the "
+            "issuer on infra-box), or GITHUB_APP_ID plus a PEM"
+        )
     now = int(time.time())
     with open(PEM_PATH, "rb") as f:
         key = f.read()
@@ -203,37 +220,52 @@ def paginate(path, token, key=None):
     raise RuntimeError(f"{path}: more than 5000 items, refusing to page further")
 
 
+def repos_for_token(tok, label):
+    """The repos one installation token reaches, keyed for case-insensitive
+    lookup. Logged, so a stray grant is visible rather than merely harmless."""
+    repos, granted = {}, []
+    for r in paginate("/installation/repositories", tok, key="repositories"):
+        repos[r["full_name"].lower()] = (r["full_name"], tok)
+        granted.append(r["name"])
+    log(f"github: {label} granted {len(granted)} repo(s): "
+        f"{', '.join(sorted(granted)) or '(none)'}")
+    return repos
+
+
 def discover_github():
     """Every repo the App has actually been granted, with a token that reaches it.
 
-    An App set to "Any account" gets a *separate installation per account* - a
-    personal account and two orgs are three installations with three ids and
-    three tokens, and a token is only valid for its own installation. So the
-    unit of auth is the account, not the App. Installation ids are derivable
-    from the PEM, so they are discovered rather than being values a human has
-    to find and copy.
+    Two ways in, and the deployed one is the token.
 
-    One token is minted per installation, including ones nothing is used from.
-    There is no App-JWT endpoint that lists an installation's repositories, so
-    the token is the only way to see inside one; unwanted ones are dropped
-    immediately. The per-account repo list is logged so a stray installation is
-    visible rather than merely harmless.
+    **GITHUB_INSTALLATION_TOKEN** - minted by the issuer on infra-box, which is
+    the only place the App's PEM lives. The mirror then holds a credential that
+    expires in an hour rather than one that never does. The token must be
+    installation-WIDE: the issuer can narrow a token to a repo list, and doing
+    that here would quietly move enrolment out of the App grant and into the
+    issuer's flags, which is exactly the thing enrolment is not allowed to be.
+    Granted means fully enrolled; this function is how that is read.
+
+    **The PEM**, for a deployment with no issuer (loop mode, a laptop). An App
+    set to "Any account" gets a *separate installation per account*, each with
+    its own id and its own token, and a token is only valid for its own
+    installation - so the unit of auth is the account, not the App. Installation
+    ids are derivable from the PEM, so they are discovered rather than being
+    values a human has to find and copy. There is no App-JWT endpoint that lists
+    an installation's repositories, so a token per installation is the only way
+    to see inside one.
 
     Returns {lowercased owner/name: (owner/name, token)}.
     """
+    if INSTALL_TOKEN:
+        return repos_for_token(INSTALL_TOKEN, "installation token")
+
     j = app_jwt()
     repos = {}
     for inst in paginate("/app/installations", j):
-        acct = inst["account"]["login"]
         tok = api(
             f"/app/installations/{inst['id']}/access_tokens", j, method="POST"
         )["token"]
-        granted = []
-        for r in paginate("/installation/repositories", tok, key="repositories"):
-            repos[r["full_name"].lower()] = (r["full_name"], tok)
-            granted.append(r["name"])
-        log(f"github: {acct} granted {len(granted)} repo(s): "
-            f"{', '.join(sorted(granted)) or '(none)'}")
+        repos.update(repos_for_token(tok, inst["account"]["login"]))
     return repos
 
 
@@ -301,8 +333,6 @@ def discover():
     ok = True
     pairs, ungranted = [], []
     for repo_id, gh_repo in sorted(bz.items()):
-        if ONLY and repo_id not in ONLY:
-            continue
         if gh_repo.lower() in contested:
             continue
         hit = gh.get(gh_repo.lower())
@@ -325,8 +355,6 @@ def discover():
     if unannounced:
         log("skipped, granted to the App but not announced on buzz: "
             + ", ".join(unannounced))
-    for missing in sorted(ONLY - set(bz)):
-        log(f"WARN MIRROR_ONLY names {missing}, which has no buzz announcement")
     return pairs, ok
 
 
@@ -563,9 +591,10 @@ def tick():
 def hold_lock():
     """Take the run lock, or return None if another run already has it.
 
-    Coolify does not dedupe scheduled runs: if a reconcile outlives the cron
-    interval, the next `docker exec` starts regardless. Two runs sharing the
-    bare clones and state.json would interleave fetches and let the last writer
+    systemd already refuses to start a second instance of an active unit, so the
+    timed runs cannot overlap on their own. This covers what it does not: a
+    hand-run `docker run` alongside a timed one. Two runs sharing the bare
+    clones and state.json would interleave fetches and let the last writer
     clobber halt state.
 
     An overlap is not a failure - the caller exits 0 - because paging someone
@@ -591,15 +620,12 @@ def main():
     and if the platform already has one, it should own the schedule instead.
 
       --once   run a single reconcile and exit non-zero if anything failed.
-               Meant for a Coolify scheduled task, where the *failure itself*
-               is the alert - no last-success file, no staleness probe, no
-               second task watching the first. Note that Coolify execs into a
-               running container, so this still needs one to be up; the
-               deployment keeps `sleep infinity` as its main process for that.
+               The deployed shape: one container per run, started by a systemd
+               timer, where the *failure itself* is the alert via OnFailure=.
 
       (default) loop forever. For when a scheduler is not available, or when a
                sub-minute interval is wanted. Liveness then needs the
-               healthcheck + a separate staleness task, because a wedged
+               healthcheck + a separate staleness check, because a wedged
                long-running process never exits to be noticed.
 
     Prefer --once. It is strictly less machinery for the same behaviour.
@@ -615,8 +641,8 @@ def main():
         try:
             ok = tick()
         except Exception as e:
-            # Discovery itself can fail - GitHub down, PEM revoked - and that is
-            # not a per-repo halt. Exit non-zero so the scheduled task reports it.
+            # Discovery itself can fail - GitHub down, token revoked - and that
+            # is not a per-repo halt. Exit non-zero so the unit reports it.
             log(f"ERROR tick failed: {e}")
             return 1
         log("ok" if ok else "one or more repos halted")

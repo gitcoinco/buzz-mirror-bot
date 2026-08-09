@@ -129,64 +129,64 @@ them; fix the `web` tags so each points at its own repo
 
 Everything else still mirrors — one bad `web` tag should not stop the rest.
 
-`MIRROR_ONLY` (a JSON array of buzz repo-ids) restricts the set further. It exists to point a
-test deployment at one scratch repo; leave it unset in production.
+**There is no way to restrict the set further, on purpose.** Enrolment is the App grant and
+nothing else: granted means fully enrolled, in both directions — the mirror pushes it and the
+dispatcher builds it, because those are two halves of one system rather than two things to opt
+into separately. `MIRROR_ONLY` used to exist as a test escape hatch and setting it is now a hard
+startup error. To mirror one scratch repo, grant the App one scratch repo.
 
-## Run it as a scheduled task, not a long-running process
+## One container per run, on a systemd timer
 
 Every run is self-contained: state lives in `state.json` and the bare clones on the volume, never
-in memory. So the loop is *only* a scheduler, and if the platform already has one it should own
-the schedule instead.
+in memory. So nothing needs a process to stay alive.
 
 ```sh
 python3 mirror/sync.py --once     # one reconcile, exit non-zero if anything failed
 ```
 
-Run that as a **Coolify scheduled task**. The run's own exit status is the alert, and Coolify's
-**Scheduled Task Failure** notification fires on it directly — email / Slack / Discord / Telegram
-/ Pushover / webhook, out-of-band from Buzz and from the mirror's own identity.
+The deployed shape runs that in a fresh container every five minutes, from a systemd timer on
+**infra-box** (`deploy/`):
 
-### It still needs a container to be up
-
-Coolify's scheduled tasks `docker exec` into an **already-running** container — from
-`app/Jobs/ScheduledTaskJob.php`:
-
-```php
-$cmd  = "sh -c '".str_replace("'", "'\''", $this->task->command)."'";
-$exec = "docker exec {$containerName} {$cmd}";
-```
-
-They do not start one, and Coolify has no host-level cron at all
-([#8500](https://github.com/coollabsio/coolify/issues/8500)). So the deployed shape is:
-
-| | |
+| unit | what |
 |---|---|
-| main process | `sleep infinity` — exists only to be exec'd into |
-| scheduled task | `/app/mirror/entrypoint.sh --once` — the actual mirror run |
+| `buzz-mirror.timer` | `OnCalendar=*:0/5`, `Persistent=true` |
+| `buzz-mirror.service` | `Type=oneshot`, runs `deploy/run-once.sh` |
+| `buzz-mirror-alert@.service` | `OnFailure=` target — posts the failure to Buzz |
 
-A `sleep infinity` main process looks pointless. The payoff is that **one notification path covers
-two failures**: the command runs through `instant_remote_process(..., throwError: true)`, so a
-non-zero exit is recorded as `status => 'failed'` and sends `TaskFailed` — and if the container is
-gone, container discovery finds no name and the exec fails the same way. A dead mirror and a
-missing mirror alert identically.
+`run-once.sh` asks the local issuer for an installation token and does
+`docker run --rm <image> --once`. Nothing is kept up between runs.
 
-That still deletes a layer: no `last-success` file, no staleness probe, no container healthcheck,
-no second scheduled task watching the first.
+### Why not a Coolify scheduled task
 
-Concurrent runs are handled with an exclusive `flock` on `$MIRROR_STATE_DIR/lock`, because Coolify
-does not dedupe: if a reconcile outlives the cron interval the next exec starts anyway, and two
-runs would interleave fetches on the same bare clones. An overlapping run exits **0** — paging
-someone about a slow tick is how an alert channel gets ignored.
+That was the earlier design and it cost two things. Coolify's scheduled tasks `docker exec` into
+an **already-running** container (`app/Jobs/ScheduledTaskJob.php`) rather than starting one, and
+Coolify has no host-level cron ([#8500](https://github.com/coollabsio/coolify/issues/8500)) — so
+the container had to run `sleep infinity` purely to be an exec target. And Coolify keeps every app
+env var in its database, which is where the GitHub App PEM would have lived.
+
+Running on infra-box removes both. The issuer is local, so the mirror is handed a token that
+expires in an hour instead of a key that never does, and there is no exec target because each run
+is its own container.
+
+Concurrent runs: systemd will not start a second instance of an active unit, so the timed runs
+cannot overlap. `sync.py` keeps its exclusive `flock` on `$MIRROR_STATE_DIR/lock` anyway, for the
+case systemd cannot see — a hand-run `docker run` alongside a timed one. An overlapping run exits
+**0**; paging someone about a slow tick is how an alert channel gets ignored.
 
 ### Liveness
 
-Falls out of the above. A failed run notifies, and so does a missing container. A run that never
-happens is Coolify's scheduler being down, which is the same failure as the host being down.
+Two failures, two mechanisms, because one cannot cover both:
 
-The **loop mode** (no `--once`) exists for when no scheduler is available or a sub-minute interval
-is wanted. It costs more: drop `command:` from the compose file, and add back `last-success` +
-`mirror/healthcheck.sh` as a container `HEALTHCHECK` so Coolify restarts a wedged-but-running
-process, plus a separate scheduled staleness check for the alert:
+- **A run that fails** → the unit's `OnFailure=` fires `buzz-mirror-alert@.service`, which posts
+  the unit name and the last 20 journal lines.
+- **A run that never happens** → nothing fails, so there is nothing to hook. `touch_last_success()`
+  writes `$MIRROR_STATE_DIR/last-success` after every fully-successful tick, and fleet-audit
+  asserts on its age (< 26h) from outside this process. That is the only place an alert about a
+  dead mirror can honestly live.
+
+The **loop mode** (no `--once`) exists for anywhere without a scheduler, or a sub-minute interval.
+It costs more: `mirror/healthcheck.sh` as a container `HEALTHCHECK` so the runtime restarts a
+wedged-but-running process, plus a separate staleness check for the alert:
 
 ```dockerfile
 HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
@@ -196,12 +196,8 @@ HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=2 \
 A wedged long-running process never exits to be noticed, and an alert that shares a process with
 the thing it watches is not an alert.
 
-> **Verify the notification fires.** There are open Coolify reports of failure notifications not
-> being sent while success notifications are. Test it once with a deliberate failure. An alarm you
-> believe in but do not have is worse than no alarm.
-
-**Not covered:** whole-host death, since Coolify dies with it. Accepted — it would be evident
-from everything else being down.
+**Not covered:** whole-host death. Accepted — it would be evident from everything else being down,
+and fleet-audit's staleness assertion catches it anyway.
 
 ## Why polling, not the ref-state subscription
 
@@ -218,82 +214,98 @@ as a pure latency optimisation without touching the decision tree.
 
 ## Deploying
 
-The Coolify application does not exist until you create it. `docker-compose.yml` is its
-definition: Coolify treats a compose file as [the single source of
-truth](https://coolify.io/docs/knowledge-base/docker/compose) — it parses every `${VAR}` into a UI
-field, and the `${VAR:?}` ones block deploy until filled. The file is the form.
+Everything installs on **infra-box**, as root. Nothing is a Coolify resource.
 
-**Source must be GitHub.** Coolify cannot clone from Buzz: Buzz git authenticates with NIP-98 via
-`git-credential-nostr` and Coolify has no such helper. This is the same reason GitHub `main` sits
-upstream of production. So whatever you deploy has to reach GitHub `main` first.
+1. `/etc/buzz-mirror/env`, `0600`, root-owned — see [Configuration](#configuration).
+2. `deploy/run-once.sh` and `deploy/alert.sh` → `/opt/buzz-mirror/`, `0700`.
+3. The three unit files → `/etc/systemd/system/`, then
+   `systemctl daemon-reload && systemctl enable --now buzz-mirror.timer`.
+4. `systemctl start buzz-mirror.service` once by hand and read the journal before trusting the
+   timer.
 
-**+ New → Public Repository**
+**Both prerequisites now exist in the infra repo (`agentic-engineering-infra`, `50f372b`):**
 
-| field | value |
-|---|---|
-| Repository URL | `https://github.com/gitcoinco/buzz-mirror-bot` |
-| Branch | `main` |
-| Build Pack | Docker Compose |
-| Compose file location | `/docker-compose.yml` |
-
-Fill the four required environment variables — `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`,
-`GITHUB_APP_ID`, `GITHUB_APP_PEM_B64` — and deploy. The container comes up running
-`sleep infinity` and does nothing; that is correct, it is only an exec target.
-
-Then **Scheduled Tasks → + Add**:
-
-| field | value |
-|---|---|
-| Name | `mirror` |
-| Command | `/app/mirror/entrypoint.sh --once` |
-| Frequency | `*/5 * * * *` |
-
-If it asks for a container name, that is the compose service name: `mirror`.
-
-Finally, **Team → Notifications → Scheduled Task Failure** must be enabled on a channel someone
-reads. Without it the alerting design here is inert.
-
-`tofu import` it when the OpenTofu migration reaches it — the `coolify-terraform/coolify` provider
-supports import on every stateful resource, so building it in the UI now costs no rework later.
+- **The token issuer** is `host/gh-app-token.sh` on infra-box, installed as
+  `${GH_APP_TOKEN_CMD:-/usr/local/bin/gh-app-token}`. It mints from the App PEM at
+  `/root/gh-app/app.pem`, which stays on that box and is read by nothing else.
+- **The image** comes from the fleet build pipeline. `fleet-build.yml` carries non-app entries —
+  an entry with no `app_uuid` is build-and-push only — so the mirror's image rides the same
+  pipeline as everything else and lands in the fleet registry. `MIRROR_IMAGE` points at that tag.
+  This needs the App installed on **`gitcoinco`** as well, because that is where
+  `buzz-mirror-bot` lives and the dispatcher clones with a token scoped to the repo's own owner.
+  That installation is for *building*, not mirroring — see below.
 
 ### Do not let the mirror mirror itself
 
-Coolify deploys this repo from GitHub, and GitHub would be fed by the mirror. If the mirror breaks,
-a fix pushed to Buzz cannot reach GitHub, so it cannot deploy, so it stays broken.
+`buzz-mirror-bot`'s own image is built from its GitHub `main`, and GitHub would be fed by the
+mirror. If the mirror breaks, a fix pushed to Buzz cannot reach GitHub, so it cannot be built, so
+it stays broken.
 
 **Keep `.github/workflows/buzz-mirror-main.yml` on `buzz-mirror-bot` specifically.** Everywhere
 else it is exactly the per-repo cost this replaces and should be deleted once the mirror is proven.
 Here it is not redundancy — it is the only thing that breaks the deadlock.
 
+The exclusion is also structural, and it is worth naming because it is easy to break by accident.
+`buzz-mirror-bot` satisfies the *Buzz* half of enrolment today — it is announced under
+`BUZZ_REPO_OWNER` with a `web` tag pointing at `github.com/gitcoinco/buzz-mirror-bot`. What keeps
+it out of the mirror set is the *GitHub* half: a token is only ever valid for one installation, so
+`GITHUB_OWNER` names exactly one account and `/installation/repositories` can only ever answer with
+repos from that one. Enrolment is therefore "granted to the App **in the `GITHUB_OWNER`
+installation**", and `gitcoinco` is not it.
+
+So the App can be installed on `gitcoinco` to build the mirror image without enrolling the mirror
+in itself. The thing that would break the deadlock protection is pointing `GITHUB_OWNER` at
+`gitcoinco`, not granting the App there.
+
 ### Configuration
 
 | var | what |
 |---|---|
+| `MIRROR_IMAGE` | the image `run-once.sh` runs. **Required** |
+| `GITHUB_OWNER` | the App installation to mirror, e.g. `irlfund`. **Required** |
 | `BUZZ_PRIVATE_KEY` | mirror-bot's nostr key. Must be a member of every bound channel |
 | `BUZZ_AUTH_TAG` | NIP-OA owner attestation |
-| `GITHUB_APP_ID` | the App's id |
-| `GITHUB_APP_PEM_B64` | the App private key, base64 (`base64 < key.pem \| tr -d '\\n'`) |
 | `BUZZ_REPO_OWNER` | 64-char hex pubkey that announced the repos |
-| `MIRROR_ALERT_CHANNEL` | channel UUID for halt and recovery messages |
-| `MIRROR_ONLY` | *optional.* JSON array of buzz repo-ids to restrict to. Unset = everything discovered |
+| `MIRROR_ALERT_CHANNEL` | channel UUID for halt, recovery and adoption messages |
+| `GH_APP_TOKEN_CMD` | *optional.* Issuer path. Default `/usr/local/bin/gh-app-token` |
 | `MIRROR_INTERVAL_SECS` | loop mode only; ignored by `--once`. Default 60 |
 
-**There is no repo list.** `MIRROR_REPOS` is gone; setting it is now a hard startup error rather
-than a silently ignored value. See [What gets mirrored](#what-gets-mirrored).
+**No GitHub credential appears here.** `run-once.sh` mints
+`GITHUB_INSTALLATION_TOKEN` per run and passes it with `-e GITHUB_INSTALLATION_TOKEN` — no value
+on the command line, so it never lands in `argv` or `ps`. It expires in an hour whatever happens
+to it.
 
-The **installation id is not configured** either — it is discovered from the PEM via
-`GET /app/installations`. It is derivable, so it should not be one more value a human has to find.
+That token must be **installation-wide**: `run-once.sh` calls the issuer with `--owner
+"$GITHUB_OWNER"` and no `--repos`. The issuer can narrow a token to a repo list, which is right for
+build-box — it only needs `contents: read` on the repos it builds — and wrong here: the mirror set
+*is* the App's grants, so a narrowed token would quietly move enrolment out of the App install UI
+and into a config file. Granted means fully enrolled.
+
+`--owner` is not optional in practice. A token is only valid for the installation that issued it,
+and the App is installed on more than one account, so the issuer's omit-when-there-is-exactly-one
+shortcut does not apply.
+
+**There is no repo list.** `MIRROR_REPOS` and `MIRROR_ONLY` are both gone; setting either is a
+hard startup error rather than a silently ignored value. See
+[What gets mirrored](#what-gets-mirrored).
+
+<details>
+<summary>The PEM fallback, for a deployment with no issuer</summary>
+
+Set `GITHUB_APP_ID` and `GITHUB_APP_PEM_B64` instead of a token. The installation id is *not*
+configured — it is discovered from the PEM via `GET /app/installations`, and an App set to
+"Any account" gets one installation per account, each needing its own token.
 
 The PEM arrives as an environment variable and the entrypoint moves it to a `0400` tmpfs file
-before anything else runs. That is weaker than systemd's `LoadCredential`, since it transits an
-env var on the way in; it is the accepted cost of deploying through Coolify rather than as a host
-unit.
+before anything else runs, then unsets it. That is weaker than the token path in the way that
+matters: a PEM does not expire.
 
-Use **`GITHUB_APP_PEM_B64`**. A PEM is multi-line and secret-store form fields are not, so a raw
-paste is the most likely setup mistake there is. `GITHUB_APP_PEM` is also accepted for a
-single-line value with literal `\n` escapes; both paths normalise to the same bytes. The
-entrypoint checks for `BEGIN`/`END` markers and refuses to start on a mangled value rather than
-failing later with an opaque JWT error.
+Use `GITHUB_APP_PEM_B64`. A PEM is multi-line and secret-store fields are not, so a raw paste is
+the most likely setup mistake there is. `GITHUB_APP_PEM` is also accepted for a single-line value
+with literal `\n` escapes; both normalise to the same bytes. The entrypoint checks for
+`BEGIN`/`END` markers and refuses to start on a mangled value rather than failing later with an
+opaque JWT error.
+</details>
 
 ### Creating the GitHub App
 

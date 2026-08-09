@@ -1,29 +1,23 @@
 #!/bin/sh
 # Staleness check on the last fully-successful tick.
 #
-# LOOP MODE ONLY. Under the deployed shape - `sync.py --once` as a Coolify
-# scheduled task - this is unnecessary: the run's own exit status is the alert,
-# and a missing container fails the exec the same way. It is not wired into the
-# image; see docs/MIRROR.md for how to add it back if you run the loop.
+# LOOP MODE ONLY. The deployed shape is `--once` from a systemd timer, where a
+# failed run alerts through the unit's OnFailure= and a timer that stops firing
+# is caught by fleet-audit asserting on the same `last-success` file from
+# outside. This script is not wired into the image; docs/MIRROR.md says how to
+# add it back if you run the loop.
 #
 # It exists because a wedged long-running process never exits to be noticed. Use
 # it in two places, deliberately the same script:
-#   1. the container HEALTHCHECK  -> Coolify restarts a wedged-but-running loop
-#   2. a Coolify scheduled task   -> Coolify fires "Scheduled Task Failure",
-#                                    which is the out-of-band alert path
+#   1. the container HEALTHCHECK -> the runtime restarts a wedged-but-running loop
+#   2. an out-of-band scheduled check -> the actual alert
 #
 # (2) is the one that matters. An alert emitted by the mirror itself dies with
 # it, and the sharpest wedge mode - the Buzz key being dropped from a channel -
 # takes out its ability to post at the same moment it takes out its ability to
-# fetch. This check runs in a different process, on a different schedule, and
-# alerts through Coolify rather than through Buzz.
+# fetch. This check has to run in a different process, on a different schedule.
 #
 # Exit 0 = fresh, exit 1 = stale. Nothing else.
-#
-# NOTE: verify the Coolify notification actually fires, once, with a deliberate
-# failure. There are open upstream reports of failure notifications not being
-# sent while success notifications are. An alarm you believe in but do not have
-# is worse than no alarm.
 
 set -eu
 
