@@ -1,0 +1,18 @@
+# Build spec for the fleet pipeline (aei wiki/architecture/fleet-pipeline.md).
+# The dispatcher reads this file from the pushed sha; enrolment is the GitHub
+# App grant on gitcoinco, nothing here declares it.
+#
+# `name` is BARE on purpose — the dispatcher prefixes lc(owner)/lc(repo)/, so
+# this builds and pushes:
+#     build-box.prairiedog-tet.ts.net:5000/gitcoinco/buzz-mirror-bot/mirror:<short-sha>
+# which is what MIRROR_IMAGE in infra-box:/etc/buzz-mirror/env points at.
+images:
+  - name: mirror
+    dockerfile: Dockerfile
+    context: .
+
+# Required, not decorative: the mirror is not a Coolify application (it runs as
+# buzz-mirror.timer on infra-box), so no app will ever match it — and the
+# dispatcher treats "zero matched apps" as a FAILURE unless build-only is
+# declared here explicitly.
+deploy: none

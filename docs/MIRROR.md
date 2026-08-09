@@ -68,6 +68,33 @@ The fallback is not matched on the relay's denial text — a transient network f
 too, and the proposal's own push fails the same way, which halts as a reconcile failure.
 Guessing which one it was would only add a way to guess wrong.
 
+**As of 2026-08-09 no repo uses this path.** All four carry
+`push:member no-force-push no-delete` on `refs/heads/main`:
+
+| repo | | |
+|---|---|---|
+| `regenos-dev` | `push:member` | app repo |
+| `local-almanac-mirror` | `push:member` | app repo |
+| `agentic-engineering-infra` | `push:member` | control plane — see the note below |
+| `buzz-mirror-bot` | `push:member` | not in the mirror set anyway (`GITHUB_OWNER`) |
+
+That is a deliberate call by the owner (2026-08-09): agentic upgrade of the fleet is worth more
+right now than the review gate, and the flip back is one republished announcement per repo.
+
+For **aei** it is worth being precise about what that buys and costs, because aei's build is a
+converge that ends in `tofu apply` as root. The gate it removes is *not* the one it looks like:
+the converge is triggered by a **GitHub** push, so a direct push to GitHub always reached `tofu
+apply` without passing through Buzz at all. What `push:owner` was actually gating is the other
+direction — Buzz → GitHub. With `push:member`, any Member of aei's bound channel can fast-forward
+Buzz `main`, the mirror carries it to GitHub, and the converge runs it as root. So the set that
+can reach root on infra-box widens from "GitHub write + repo owner" to "GitHub write + repo owner
++ aei channel Members". That widening is the feature being bought, not a side effect: it is what
+lets an agent ship an infra change end to end.
+
+The claim in aei's `wiki/architecture/fleet-pipeline.md` that repo-driven root execution is
+"acceptable ONLY because aei is merge-gated and `push:owner` in the mirror" no longer holds as
+written and needs updating there.
+
 There is no server-side merge on Buzz. `buzz pr status --status merged --merge-commit <sha>`
 takes the merge commit as an *input* — setting a PR merged records that you merged it. Since
 GitHub-ahead means Buzz `main` is an ancestor, adopting it is a fast-forward, so the one-line
@@ -223,17 +250,40 @@ Everything installs on **infra-box**, as root. Nothing is a Coolify resource.
 4. `systemctl start buzz-mirror.service` once by hand and read the journal before trusting the
    timer.
 
-**Both prerequisites now exist in the infra repo (`agentic-engineering-infra`, `50f372b`):**
+**Steps 2 and 3 should not stay manual.** aei owns host plumbing through
+`host/install-fleet-units.sh` (units in `host/units/`, run by the converge, idempotent, and the
+recovery path after a box rebuild) — and its header states the rule directly: *"Tofu deliberately
+does NOT manage these: its providers speak Coolify and GitHub; host plumbing follows the repo's
+own 'idempotent scripts, not command history' contract."* So these units belong in aei
+`host/units/` and the two scripts in aei `host/`, exactly like `fleet-dispatch.service` and
+`fleet-dispatch.py`. This repo keeps what it is good for — the mirror program and its image.
+Only `/etc/buzz-mirror/env` stays hand-seeded, because it holds secrets and aei never templates
+credentials.
+
+**Both prerequisites now exist in the infra repo (`agentic-engineering-infra`, `dbffa83`):**
 
 - **The token issuer** is `host/gh-app-token.sh` on infra-box, installed as
   `${GH_APP_TOKEN_CMD:-/usr/local/bin/gh-app-token}`. It mints from the App PEM at
   `/root/gh-app/app.pem`, which stays on that box and is read by nothing else.
-- **The image** comes from the fleet build pipeline. `fleet-build.yml` carries non-app entries —
-  an entry with no `app_uuid` is build-and-push only — so the mirror's image rides the same
-  pipeline as everything else and lands in the fleet registry. `MIRROR_IMAGE` points at that tag.
-  This needs the App installed on **`gitcoinco`** as well, because that is where
-  `buzz-mirror-bot` lives and the dispatcher clones with a token scoped to the repo's own owner.
-  That installation is for *building*, not mirroring — see below.
+- **The image** comes from the fleet build pipeline, which is now *derive, don't declare*
+  (`wiki/architecture/fleet-pipeline.md`): the central `fleet-build.yml` is gone and each repo
+  carries its own `.fleet-build.yml`. Ours declares `deploy: none` — required, because the
+  dispatcher treats zero matched Coolify apps as a failure unless build-only is explicit. The
+  dispatcher prefixes the `lc(owner)/lc(repo)/` namespace, so the tag is:
+
+  ```
+  build-box.prairiedog-tet.ts.net:5000/gitcoinco/buzz-mirror-bot/mirror:<short-sha>
+  ```
+
+  The App is installed on `gitcoinco` (installation `152473360`) so the dispatcher can clone
+  with a token scoped to the repo's own owner. That installation is for *building*, not
+  mirroring — see below.
+
+**Still missing for an automatic build:** a GitHub webhook on `gitcoinco/buzz-mirror-bot` →
+`https://hooks.infra.gitcoin.co/build/gitcoinco/buzz-mirror-bot`, with its HMAC secret in
+infra-box `/root/fleet-dispatch/secrets/gitcoinco_buzz-mirror-bot`. In aei that means a second
+`github` provider alias for `gitcoinco` alongside the `irlfund` one in `tofu/github.tf`. Until it
+exists, the image is built by hand or by re-delivering a push.
 
 ### Do not let the mirror mirror itself
 
