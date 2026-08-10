@@ -400,13 +400,30 @@ def ensure_repo(repo_id):
     return d
 
 
+def remote_main(d, url, side):
+    """Fetch one side's main and return (tip_sha, head_count).
+
+    tip_sha is None when the remote has no `main` - a repo announced before its
+    first push, or one whose default branch is named something else. head_count
+    tells those apart: 0 is an empty repo, more means branches exist but none
+    of them is `main`. The listing goes first because fetching a missing ref is
+    an error, and one indistinguishable from a typo'd refspec."""
+    heads = [line.split("\t", 1)[1] for line in
+             git(d, "ls-remote", "--heads", url).splitlines() if "\t" in line]
+    if "refs/heads/main" not in heads:
+        # Drop any tracking ref from an earlier tick, or a ref deleted on the
+        # remote would keep its last known tip here forever.
+        subprocess.run(["git", "-C", d, "update-ref", "-d",
+                        f"refs/remotes/{side}/main"], capture_output=True)
+        return None, len(heads)
+    git(d, "fetch", "-q", "--no-tags", url,
+        f"+refs/heads/main:refs/remotes/{side}/main")
+    return git(d, "rev-parse", f"refs/remotes/{side}/main"), len(heads)
+
+
 def fetch_both(d, repo_id, gh_repo, token):
-    git(d, "fetch", "-q", "--no-tags", buzz_url(repo_id),
-        "+refs/heads/main:refs/remotes/buzz/main")
-    git(d, "fetch", "-q", "--no-tags", github_url(gh_repo, token),
-        "+refs/heads/main:refs/remotes/github/main")
-    return (git(d, "rev-parse", "refs/remotes/buzz/main"),
-            git(d, "rev-parse", "refs/remotes/github/main"))
+    return (remote_main(d, buzz_url(repo_id), "buzz"),
+            remote_main(d, github_url(gh_repo, token), "github"))
 
 
 def is_ancestor(d, a, b):
@@ -516,7 +533,51 @@ def propose_github_ahead(d, repo_id, gh_repo, gh_tip, state):
 
 def reconcile(repo_id, gh_repo, token, state):
     d = ensure_repo(repo_id)
-    buzz_tip, gh_tip = fetch_both(d, repo_id, gh_repo, token)
+    (buzz_tip, _), (gh_tip, gh_heads) = fetch_both(d, repo_id, gh_repo, token)
+
+    if gh_tip is None and gh_heads:
+        # GitHub has branches but none of them is main: a repo whose default
+        # branch is named something else. Creating a main from Buzz next to
+        # that history would be a guess about intent; the fix is a rename on
+        # GitHub, and the next tick picks it up.
+        halt(state, repo_id, "github-no-main",
+             f"`{gh_repo}` has branches but no `main`, and this mirror is "
+             f"main-only. Rename the default branch to `main` (or push one) "
+             f"to start mirroring.")
+        return
+
+    if buzz_tip is None and gh_tip is None:
+        # Announced before either side's first push. Nothing to reconcile yet,
+        # and not an error: the pair starts mirroring at the first commit.
+        clear_halt(state, repo_id)
+        return
+
+    if buzz_tip is None:
+        # A fresh Buzz repo paired with existing GitHub history - the
+        # onboarding shape. Creating main IS the adoption; there is no local
+        # history for ancestry to protect. Other branches on the Buzz side
+        # (an earlier tick's proposal branch, say) change nothing: main is
+        # still absent.
+        try:
+            git(d, "push", buzz_url(repo_id), f"{gh_tip}:refs/heads/main")
+        except RuntimeError as e:
+            log(f"{repo_id}: buzz main refused the bootstrap ({e}); proposing instead")
+            propose_github_ahead(d, repo_id, gh_repo, gh_tip, state)
+            return
+        log(f"{repo_id}: buzz main created at {gh_tip[:7]} (bootstrapped from github)")
+        post(f"`{repo_id}`: empty Buzz repo - created main at `{gh_tip[:7]}` from "
+             f"GitHub (`{gh_repo}`). Nothing was rewritten.")
+        clear_halt(state, repo_id)
+        return
+
+    if gh_tip is None:
+        # A truly empty GitHub repo paired with Buzz history: seed it. Same
+        # plain non-force push as the steady-state direction, and silent for
+        # the same reason that direction is.
+        git(d, "push", github_url(gh_repo, token), f"{buzz_tip}:refs/heads/main")
+        log(f"{repo_id}: github main created at {buzz_tip[:7]} (seeded from buzz)")
+        clear_halt(state, repo_id)
+        return
 
     if buzz_tip == gh_tip:
         clear_halt(state, repo_id)

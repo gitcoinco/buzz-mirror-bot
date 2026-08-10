@@ -79,6 +79,12 @@ def tip(repo):
                           capture_output=True, text=True).stdout.strip()
 
 
+def has_main(repo):
+    # Not tip() == "": rev-parse echoes an unresolvable arg to stdout.
+    return subprocess.run(["git", "-C", repo, "show-ref", "--verify", "-q",
+                           "refs/heads/main"], capture_output=True).returncode == 0
+
+
 def check(label, cond):
     print(f"  {'PASS' if cond else 'FAIL'}  {label}")
     if not cond:
@@ -168,6 +174,79 @@ sh("git", "push", "-qf", GITHUB, f"{b}:main", cwd=work)
 sync.reconcile("r", "o/r", "tok", state)
 check("halt cleared", not state["r"].get("halted"))
 check("announced recovery", any("recovered" in p for p in POSTS))
+
+# 6. empty buzz repo, github has history -> bootstrap: create buzz main.
+#    The onboarding shape: a repo announced on Buzz before anything was pushed.
+work, base = scenario("empty buzz bootstraps from github")
+sh("git", "-C", BUZZ, "update-ref", "-d", "refs/heads/main")
+new = commit(work, "github work")
+sh("git", "push", "-q", GITHUB, "main:main", cwd=work)
+state = {}
+sync.reconcile("r", "o/r", "tok", state)
+check("buzz main created at github tip", tip(BUZZ) == new)
+check("not halted", not state.get("r", {}).get("halted"))
+check("announced the bootstrap", any("empty Buzz repo" in p for p in POSTS))
+
+# 6b. converged now, so the next tick is silent
+POSTS.clear()
+sync.reconcile("r", "o/r", "tok", state)
+check("silent once the tips match", POSTS == [])
+
+# 6c. a stray branch on the empty buzz side (a proposal branch from an earlier
+#     tick, say) does not change the case: main is still absent.
+work, base = scenario("empty buzz with a stray branch")
+sh("git", "-C", BUZZ, "update-ref", "-d", "refs/heads/main")
+sh("git", "push", "-q", BUZZ, "main:refs/heads/mirror/leftover", cwd=work)
+sync.reconcile("r", "o/r", "tok", {})
+check("buzz main still bootstrapped", tip(BUZZ) == base)
+
+# 6d. bootstrap refused by the relay -> same proposal fallback as 3c
+work, base = scenario("bootstrap refused, propose instead")
+sh("git", "-C", BUZZ, "update-ref", "-d", "refs/heads/main")
+with open(os.path.join(BUZZ, "hooks", "pre-receive"), "w") as f:
+    f.write('#!/bin/sh\nwhile read o n ref; do\n'
+            '  [ "$ref" = refs/heads/main ] && { echo "requires Owner role" >&2; exit 1; }\n'
+            'done\nexit 0\n')
+os.chmod(os.path.join(BUZZ, "hooks", "pre-receive"), 0o755)
+state = {}
+sync.reconcile("r", "o/r", "tok", state)
+check("buzz main NOT created when the push is refused", not has_main(BUZZ))
+branches = subprocess.run(["git", "-C", BUZZ, "branch", "--list", "mirror/*"],
+                          capture_output=True, text=True).stdout
+check("fell back to a proposal branch", f"github-ahead-{base[:7]}" in branches)
+check("halted as github-ahead", state["r"]["halted"] == "github-ahead")
+
+# 7. buzz has history, github repo is truly empty -> seed it
+work, base = scenario("empty github seeded from buzz")
+sh("git", "-C", GITHUB, "update-ref", "-d", "refs/heads/main")
+state = {}
+sync.reconcile("r", "o/r", "tok", state)
+check("github main created at buzz tip", tip(GITHUB) == base)
+check("not halted", not state.get("r", {}).get("halted"))
+check("silent, like the steady-state direction", POSTS == [])
+
+# 8. github has branches but no main -> halt, do not guess
+work, base = scenario("github default branch is not main")
+sh("git", "push", "-q", GITHUB, "main:refs/heads/master", cwd=work)
+sh("git", "-C", GITHUB, "update-ref", "-d", "refs/heads/main")
+state = {}
+sync.reconcile("r", "o/r", "tok", state)
+check("no main was invented on github", not has_main(GITHUB))
+check("halted as github-no-main", state["r"]["halted"] == "github-no-main")
+check("said what to do about it", any("Rename the default branch" in p for p in POSTS))
+POSTS.clear()
+sync.reconcile("r", "o/r", "tok", state)
+check("sticky: no repeat message on the next tick", POSTS == [])
+
+# 9. both sides empty -> nothing to do, and not an error
+work, base = scenario("both sides empty")
+sh("git", "-C", BUZZ, "update-ref", "-d", "refs/heads/main")
+sh("git", "-C", GITHUB, "update-ref", "-d", "refs/heads/main")
+state = {}
+sync.reconcile("r", "o/r", "tok", state)
+check("no refs created anywhere", not has_main(BUZZ) and not has_main(GITHUB))
+check("not halted", not state.get("r", {}).get("halted"))
+check("silent", POSTS == [])
 
 # ---------------------------------------------------------------------------
 # discovery

@@ -20,6 +20,10 @@ Per repo, per run, it fetches both `main`s into a bare clone and compares them:
 | GitHub is an ancestor of Buzz | fast-forward GitHub to Buzz's tip |
 | Buzz is an ancestor of GitHub | fast-forward Buzz to GitHub's tip — see below |
 | neither | halt as `diverged`; a human reconciles |
+| Buzz has no `main`, GitHub does | create Buzz `main` at GitHub's tip — the onboarding shape |
+| GitHub is empty, Buzz has `main` | create GitHub `main` at Buzz's tip |
+| GitHub has branches but no `main` | halt as `github-no-main`; rename the default branch |
+| neither side has a `main` | nothing — the pair starts mirroring at the first commit |
 
 Every push is plain and non-force. Nothing here can rewrite history on either side; the worst
 outcome is that a repo stops mirroring and says so.
@@ -106,7 +110,7 @@ One message per halt, not one per tick. The halt holds until the tips converge, 
 posts a recovery message.
 
 Halt reasons are named — `buzz-auth-failed`, `github-auth-failed`,
-`diverged`, `push-rejected`, `reconcile-failed`. The sharpest failure mode here is mirror-bot
+`diverged`, `push-rejected`, `reconcile-failed`, `github-no-main`. The sharpest failure mode here is mirror-bot
 being dropped from a bound channel: git read on Buzz is membership-gated, so it presents as a 404
 on fetch and looks exactly like a GitHub outage. Naming the subsystem is the entire fix.
 
