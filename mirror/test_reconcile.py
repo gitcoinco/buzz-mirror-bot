@@ -370,6 +370,67 @@ sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS)
 
 
 # ---------------------------------------------------------------------------
+# transient retry: a blip that clears in seconds must not page anyone
+# ---------------------------------------------------------------------------
+
+print("\n--- transient retry")
+
+sync.GIT_RETRY_DELAY = 0
+real_run = sync.run
+RUN_CALLS = []
+
+
+def flaky_then_ok(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError(
+            "git failed (128): remote: Internal Server Error\nfatal: unable to "
+            "access 'https://github.com/o/r.git/': The requested URL returned error: 500")
+    return "ok"
+
+
+sync.run = flaky_then_ok
+check("a 5xx is retried until it clears", sync.git("/tmp", "fetch") == "ok")
+check("it took all three attempts", len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+
+
+def denied(args, **kw):
+    RUN_CALLS.append(args)
+    raise RuntimeError("git failed (128): remote: requires Owner role")
+
+
+sync.run = denied
+try:
+    sync.git("/tmp", "push")
+    raised = False
+except RuntimeError:
+    raised = True
+check("an auth denial is not retried", raised and len(RUN_CALLS) == 1)
+
+RUN_CALLS.clear()
+
+
+def always_502(args, **kw):
+    RUN_CALLS.append(args)
+    raise RuntimeError("fatal: unable to access 'https://github.com/o/r.git/': "
+                       "The requested URL returned error: 502")
+
+
+sync.run = always_502
+try:
+    sync.git("/tmp", "fetch")
+    raised = False
+except RuntimeError:
+    raised = True
+check("a persistent 5xx still raises after the last attempt",
+      raised and len(RUN_CALLS) == sync.GIT_TRIES)
+
+sync.run = real_run
+
+
+# ---------------------------------------------------------------------------
 # --once exit status: for a scheduled task, the exit code IS the alert
 # ---------------------------------------------------------------------------
 
@@ -394,6 +455,23 @@ POSTS.clear(); touched.clear()
 check("failed run exits non-zero", sync.main() == 1)
 check("failed run did NOT record success", touched == [])
 check("failure is attributed to github", any("github-auth-failed" in p for p in POSTS))
+
+
+def boom_500(repo_id, gh_repo, tok, st):
+    raise RuntimeError("fatal: unable to access 'https://github.com/o/r.git/': "
+                       "The requested URL returned error: 500")
+
+
+# A 5xx that survives the in-tick retries still halts, but under an honest
+# label: `github-unavailable`, not `github-auth-failed`. Halts are sticky by
+# reason, so the wrong label would also swallow a real auth failure that
+# arrived while the 5xx halt was live.
+sync.reconcile = boom_500
+POSTS.clear(); touched.clear()
+check("a persistent 5xx still fails the run", sync.main() == 1)
+check("but is labelled unavailable, not an auth failure",
+      any("github-unavailable" in p for p in POSTS)
+      and not any("auth-failed" in p for p in POSTS))
 
 # Discovering nothing must fail loudly: an empty mirror set reads exactly like
 # "everything is in sync", and it is the shape a mis-click produces.

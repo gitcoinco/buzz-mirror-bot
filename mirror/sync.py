@@ -38,7 +38,10 @@ repo that should never be written from GitHub simply keeps `push:owner`.
 
 Halts are **sticky**: one message per halt, not one per tick, and the halt holds
 until the two tips converge. A halt freezes deploys for that repo, so the
-message says so.
+message says so. Before a halt is ever raised, a transiently-failing git
+operation (an HTTP 5xx, a reset connection, a timeout) is retried a couple of
+times inside the tick - see git() - so a blip that clears in seconds does not
+page anyone.
 
 **What gets mirrored is discovered, never configured.** The set is the
 intersection of two opt-ins: a repo announced on Buzz under BUZZ_REPO_OWNER with
@@ -374,8 +377,33 @@ GIT_COMMON = [
 ]
 
 
+# Failure classes worth a second attempt within the tick: a 5xx from either
+# git host, a reset connection, a timeout. Auth denials and non-fast-forward
+# rejections are deliberately absent - retrying those cannot succeed and would
+# only delay the halt.
+TRANSIENT = re.compile(r"returned error: 5\d\d|connection reset|timed out",
+                       re.IGNORECASE)
+
+GIT_TRIES = 3        # attempts per git operation within one tick
+GIT_RETRY_DELAY = 5  # seconds between attempts
+
+
 def git(repo_dir, *args):
-    return run(["git", "-C", repo_dir, *GIT_COMMON, *args])
+    """Git with the mirror's config, retrying transient network failures.
+
+    Without this, each git operation ran exactly once per tick, so a single
+    GitHub 500 that cleared itself in seconds still halted the repo and paged
+    the alert channel until the next tick recovered it. A short in-tick retry
+    absorbs those; anything that survives all attempts is worth the halt."""
+    for attempt in range(1, GIT_TRIES + 1):
+        try:
+            return run(["git", "-C", repo_dir, *GIT_COMMON, *args])
+        except RuntimeError as e:
+            if attempt == GIT_TRIES or not TRANSIENT.search(str(e)):
+                raise
+            log(f"WARN transient git failure (attempt {attempt}/{GIT_TRIES}), "
+                f"retrying in {GIT_RETRY_DELAY}s: {str(e)[:200]}")
+            time.sleep(GIT_RETRY_DELAY)
 
 
 def buzz_url(repo_id):
@@ -636,11 +664,15 @@ def tick():
             ok = False
             # Name the subsystem. "Looks like a GitHub outage but is actually a
             # revoked Buzz key" was the failure mode worth spending a branch on.
+            # Unreachable and denied are also kept apart: halts are sticky by
+            # reason, so a real auth failure arriving while a 5xx halt is live
+            # must post as its own message, not be swallowed by it.
             msg = str(e)
+            transient = bool(TRANSIENT.search(msg))
             if "buzz.gitcoin.co" in msg or "not a relay member" in msg:
-                reason = "buzz-auth-failed"
+                reason = "buzz-unavailable" if transient else "buzz-auth-failed"
             elif "github.com" in msg or "api.github.com" in msg:
-                reason = "github-auth-failed"
+                reason = "github-unavailable" if transient else "github-auth-failed"
             else:
                 reason = "reconcile-failed"
             halt(state, repo_id, reason, f"```\n{msg[:800]}\n```")
