@@ -322,7 +322,8 @@ BUZZ_REPOS_BY_OWNER = {
 }
 sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS_BY_OWNER.get(a[-1], []))
 
-bz = sync.discover_buzz()
+bz, bz_ok = sync.discover_buzz()
+check("a clean buzz discovery reports ok", bz_ok)
 check("pairing is read off the announcement, not guessed from the name",
       bz["regenos-dev"] == (OWNER1, "irlfund/regenOS"))
 check("a trailing .git does not change the pairing",
@@ -382,6 +383,25 @@ check("a contested GitHub repo fails the run", not ok)
 check("both claimants are dropped, not just the loser",
       "regenos-dev" not in names and "regenos-dupe" not in names)
 check("uncontested repos still mirror", "local-almanac-mirror" in names)
+
+# The relay accepts a second announcement of a reserved repo id (the
+# reservation fails post-ingest; the event stores and lists but the repo
+# behind it 404s forever). During migration repobot could announce an id
+# planbot holds; the pair must drop AND the run must fail loudly, or a repo
+# that was mirroring fine stops mirroring with exit 0.
+DUP_ID_BY_OWNER = {
+    OWNER1: BUZZ_REPOS_BY_OWNER[OWNER1],
+    OWNER2: BUZZ_REPOS_BY_OWNER[OWNER2] + [
+        {"tags": [["d", "regenos-dev"], ["web", "https://github.com/irlfund/regenOS"]]},
+    ],
+}
+sync.buzz_cli = lambda *a: json.dumps(DUP_ID_BY_OWNER.get(a[-1], []))
+pairs, ok = sync.discover()
+names = [r for r, _, _, _ in pairs]
+check("a repo id announced by two allowlisted owners fails the run", not ok)
+check("the duplicated id is dropped entirely", "regenos-dev" not in names)
+check("other repos still mirror around a duplicated id",
+      "local-almanac-mirror" in names and "agentic-engineering-infra" in names)
 sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS_BY_OWNER.get(a[-1], []))
 
 

@@ -115,7 +115,7 @@ APP_ID = os.environ.get("GITHUB_APP_ID", "")
 # by different daemon/agent keys (planbot, repobot) can never be re-announced
 # under one key, so the mirror follows an allowlist of keys instead. The App
 # grant stays the enrolment act; this list only says whose announcements count.
-BUZZ_OWNERS = [o.strip() for o in os.environ["BUZZ_REPO_OWNER"].split(",") if o.strip()]
+BUZZ_OWNERS = [o.strip().lower() for o in os.environ["BUZZ_REPO_OWNER"].split(",") if o.strip()]
 if not BUZZ_OWNERS:
     raise SystemExit("BUZZ_REPO_OWNER is empty")
 for _o in BUZZ_OWNERS:
@@ -300,9 +300,9 @@ def discover_buzz():
     `irlfund/local-almanac`. A repo with no GitHub `web` tag is not a mirror
     candidate and is ignored silently.
 
-    Returns {buzz repo-id: (buzz_owner, owner/name)}.
+    Returns ({buzz repo-id: (buzz_owner, owner/name)}, ok).
     """
-    out, owner_of = {}, {}
+    out, owner_of, ok = {}, {}, True
     for buzz_owner in BUZZ_OWNERS:
         for ev in json.loads(buzz_cli("repos", "list", "--owner", buzz_owner)):
             tags = {}
@@ -314,16 +314,20 @@ def discover_buzz():
                 continue
             repo_id = tags["d"]
             if repo_id in owner_of and owner_of[repo_id] != buzz_owner:
-                # The relay reserves a repo id to its creating key, so this
-                # should be impossible; if it ever happens, mirroring either
-                # would guess which is real. Drop both, loudly.
+                # Reachable: the relay accepts a second announcement of a
+                # reserved id (the reservation fails as a post-ingest side
+                # effect, so the event stores and lists but the repo behind
+                # it 404s forever). Mirroring either would guess which is
+                # real, so drop both - and fail the run, or a repo that was
+                # mirroring fine would stop mirroring with exit 0.
                 log(f"ERROR repo id {repo_id} announced by two allowlisted "
                     f"owners - skipping it entirely")
                 out.pop(repo_id, None)
+                ok = False
                 continue
             owner_of[repo_id] = buzz_owner
             out[repo_id] = (buzz_owner, m.group(1))
-    return out
+    return out, ok
 
 
 def discover():
@@ -347,7 +351,7 @@ def discover():
 
     Returns ([(repo_id, buzz_owner, owner/name, token)], ok).
     """
-    gh, bz = discover_github(), discover_buzz()
+    gh, (bz, bz_ok) = discover_github(), discover_buzz()
 
     # Collisions are resolved before anything is mirrored, not while iterating:
     # dropping the second one seen would make the winner depend on sort order.
@@ -356,7 +360,7 @@ def discover():
         claims.setdefault(gh_repo.lower(), []).append(repo_id)
     contested = {k: v for k, v in claims.items() if len(v) > 1}
 
-    ok = True
+    ok = bz_ok
     pairs, ungranted = [], []
     for repo_id, (buzz_owner, gh_repo) in sorted(bz.items()):
         if gh_repo.lower() in contested:
