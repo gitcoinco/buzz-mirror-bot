@@ -44,8 +44,9 @@ times inside the tick - see git() - so a blip that clears in seconds does not
 page anyone.
 
 **What gets mirrored is discovered, never configured.** The set is the
-intersection of two opt-ins: a repo announced on Buzz under BUZZ_REPO_OWNER with
-a GitHub `web` tag, and that same repo granted to the GitHub App. Adding a repo
+intersection of two opt-ins: a repo announced on Buzz by a pubkey in
+BUZZ_REPO_OWNER (comma-separated allowlist of announcing keys) with a GitHub
+`web` tag, and that same repo granted to the GitHub App. Adding a repo
 is a tick in GitHub's install UI - not an env var edit and a redeploy, which is
 exactly the per-repo cost this whole thing exists to remove.
 
@@ -109,7 +110,17 @@ CHANNEL = os.environ["MIRROR_ALERT_CHANNEL"]
 PEM_PATH = os.environ.get("GITHUB_APP_PEM_PATH", "/run/mirror/ghapp.pem")
 APP_ID = os.environ.get("GITHUB_APP_ID", "")
 
-BUZZ_OWNER = os.environ["BUZZ_REPO_OWNER"]
+# One or more announcing pubkeys, comma-separated. Multiple owners exist
+# because repo ids are reserved to their creating key forever: repos announced
+# by different daemon/agent keys (planbot, repobot) can never be re-announced
+# under one key, so the mirror follows an allowlist of keys instead. The App
+# grant stays the enrolment act; this list only says whose announcements count.
+BUZZ_OWNERS = [o.strip() for o in os.environ["BUZZ_REPO_OWNER"].split(",") if o.strip()]
+if not BUZZ_OWNERS:
+    raise SystemExit("BUZZ_REPO_OWNER is empty")
+for _o in BUZZ_OWNERS:
+    if not re.fullmatch(r"[0-9a-f]{64}", _o):
+        raise SystemExit(f"BUZZ_REPO_OWNER entry is not a 64-char hex pubkey: {_o!r}")
 
 # An installation token from the issuer on infra-box, if the deployment has one.
 # Preferred over the PEM: the mirror then holds a credential that expires in an
@@ -289,17 +300,29 @@ def discover_buzz():
     `irlfund/local-almanac`. A repo with no GitHub `web` tag is not a mirror
     candidate and is ignored silently.
 
-    Returns {buzz repo-id: owner/name}.
+    Returns {buzz repo-id: (buzz_owner, owner/name)}.
     """
-    out = {}
-    for ev in json.loads(buzz_cli("repos", "list", "--owner", BUZZ_OWNER)):
-        tags = {}
-        for t in ev.get("tags", []):
-            if len(t) >= 2:
-                tags.setdefault(t[0], t[1])
-        m = GITHUB_WEB.match(tags.get("web", ""))
-        if tags.get("d") and m:
-            out[tags["d"]] = m.group(1)
+    out, owner_of = {}, {}
+    for buzz_owner in BUZZ_OWNERS:
+        for ev in json.loads(buzz_cli("repos", "list", "--owner", buzz_owner)):
+            tags = {}
+            for t in ev.get("tags", []):
+                if len(t) >= 2:
+                    tags.setdefault(t[0], t[1])
+            m = GITHUB_WEB.match(tags.get("web", ""))
+            if not (tags.get("d") and m):
+                continue
+            repo_id = tags["d"]
+            if repo_id in owner_of and owner_of[repo_id] != buzz_owner:
+                # The relay reserves a repo id to its creating key, so this
+                # should be impossible; if it ever happens, mirroring either
+                # would guess which is real. Drop both, loudly.
+                log(f"ERROR repo id {repo_id} announced by two allowlisted "
+                    f"owners - skipping it entirely")
+                out.pop(repo_id, None)
+                continue
+            owner_of[repo_id] = buzz_owner
+            out[repo_id] = (buzz_owner, m.group(1))
     return out
 
 
@@ -309,7 +332,7 @@ def discover():
     Announced on Buzz with a GitHub `web` tag AND granted to the App. Requiring
     both is what makes an "Any account" App safe to leave open: a stranger who
     installs it gets nothing mirrored, because none of their repos are announced
-    under BUZZ_REPO_OWNER.
+    by an allowlisted key in BUZZ_REPO_OWNER.
 
     A mismatch on either side is logged, never halted. The GitHub grant is the
     enrolment action, so a Buzz repo nobody intends to mirror is not an error -
@@ -322,25 +345,25 @@ def discover():
     is no safe guess about which is authoritative, so both are dropped and the
     run fails.
 
-    Returns ([(repo_id, owner/name, token)], ok).
+    Returns ([(repo_id, buzz_owner, owner/name, token)], ok).
     """
     gh, bz = discover_github(), discover_buzz()
 
     # Collisions are resolved before anything is mirrored, not while iterating:
     # dropping the second one seen would make the winner depend on sort order.
     claims = {}
-    for repo_id, gh_repo in sorted(bz.items()):
+    for repo_id, (_, gh_repo) in sorted(bz.items()):
         claims.setdefault(gh_repo.lower(), []).append(repo_id)
     contested = {k: v for k, v in claims.items() if len(v) > 1}
 
     ok = True
     pairs, ungranted = [], []
-    for repo_id, gh_repo in sorted(bz.items()):
+    for repo_id, (buzz_owner, gh_repo) in sorted(bz.items()):
         if gh_repo.lower() in contested:
             continue
         hit = gh.get(gh_repo.lower())
         if hit:
-            pairs.append((repo_id, hit[0], hit[1]))
+            pairs.append((repo_id, buzz_owner, hit[0], hit[1]))
             log(f"mirroring {repo_id} -> {hit[0]}")
         else:
             ungranted.append(f"{repo_id} -> {gh_repo}")
@@ -353,7 +376,7 @@ def discover():
     if ungranted:
         log("skipped, announced on buzz but the App is not granted them: "
             + ", ".join(ungranted))
-    claimed = {full.lower() for _, full, _ in pairs}
+    claimed = {full.lower() for _, _, full, _ in pairs}
     unannounced = sorted(full for k, (full, _) in gh.items() if k not in claimed)
     if unannounced:
         log("skipped, granted to the App but not announced on buzz: "
@@ -406,8 +429,8 @@ def git(repo_dir, *args):
             time.sleep(GIT_RETRY_DELAY)
 
 
-def buzz_url(repo_id):
-    return f"{RELAY}/git/{BUZZ_OWNER}/{repo_id}.git"
+def buzz_url(buzz_owner, repo_id):
+    return f"{RELAY}/git/{buzz_owner}/{repo_id}.git"
 
 
 def github_url(gh_repo, token):
@@ -449,8 +472,8 @@ def remote_main(d, url, side):
     return git(d, "rev-parse", f"refs/remotes/{side}/main"), len(heads)
 
 
-def fetch_both(d, repo_id, gh_repo, token):
-    return (remote_main(d, buzz_url(repo_id), "buzz"),
+def fetch_both(d, buzz_owner, repo_id, gh_repo, token):
+    return (remote_main(d, buzz_url(buzz_owner, repo_id), "buzz"),
             remote_main(d, github_url(gh_repo, token), "github"))
 
 
@@ -478,15 +501,15 @@ def post(text):
         log(f"WARN could not post to buzz: {e}")
 
 
-def open_pr(repo_id, branch, sha, gh_repo):
+def open_pr(buzz_owner, repo_id, branch, sha, gh_repo):
     try:
         out = buzz_cli(
             "pr", "open",
-            "--repo-owner", BUZZ_OWNER,
+            "--repo-owner", buzz_owner,
             "--repo-id", repo_id,
             "--subject", f"GitHub is ahead of Buzz main ({sha[:7]})",
             "--commit", sha,
-            "--clone", buzz_url(repo_id),
+            "--clone", buzz_url(buzz_owner, repo_id),
             "--branch-name", branch,
             "--channel", CHANNEL,
             "--body", (
@@ -529,7 +552,7 @@ def clear_halt(state, repo_id):
     save_state(state)
 
 
-def propose_github_ahead(d, repo_id, gh_repo, gh_tip, state):
+def propose_github_ahead(d, buzz_owner, repo_id, gh_repo, gh_tip, state):
     """The fallback for a repo whose Buzz `main` this bot may not push.
 
     Puts GitHub's tip on Buzz as a branch, opens a PR for it, and halts with the
@@ -543,8 +566,8 @@ def propose_github_ahead(d, repo_id, gh_repo, gh_tip, state):
     branch = f"mirror/github-ahead-{gh_tip[:7]}"
     if state.get(repo_id, {}).get("proposed") == gh_tip:
         return
-    git(d, "push", buzz_url(repo_id), f"{gh_tip}:refs/heads/{branch}")
-    link = open_pr(repo_id, branch, gh_tip, gh_repo)
+    git(d, "push", buzz_url(buzz_owner, repo_id), f"{gh_tip}:refs/heads/{branch}")
+    link = open_pr(buzz_owner, repo_id, branch, gh_tip, gh_repo)
     state[repo_id] = {"halted": "github-ahead", "proposed": gh_tip,
                       "since": int(time.time())}
     save_state(state)
@@ -559,9 +582,9 @@ def propose_github_ahead(d, repo_id, gh_repo, gh_tip, state):
     )
 
 
-def reconcile(repo_id, gh_repo, token, state):
+def reconcile(buzz_owner, repo_id, gh_repo, token, state):
     d = ensure_repo(repo_id)
-    (buzz_tip, _), (gh_tip, gh_heads) = fetch_both(d, repo_id, gh_repo, token)
+    (buzz_tip, _), (gh_tip, gh_heads) = fetch_both(d, buzz_owner, repo_id, gh_repo, token)
 
     if gh_tip is None and gh_heads:
         # GitHub has branches but none of them is main: a repo whose default
@@ -587,10 +610,10 @@ def reconcile(repo_id, gh_repo, token, state):
         # (an earlier tick's proposal branch, say) change nothing: main is
         # still absent.
         try:
-            git(d, "push", buzz_url(repo_id), f"{gh_tip}:refs/heads/main")
+            git(d, "push", buzz_url(buzz_owner, repo_id), f"{gh_tip}:refs/heads/main")
         except RuntimeError as e:
             log(f"{repo_id}: buzz main refused the bootstrap ({e}); proposing instead")
-            propose_github_ahead(d, repo_id, gh_repo, gh_tip, state)
+            propose_github_ahead(d, buzz_owner, repo_id, gh_repo, gh_tip, state)
             return
         log(f"{repo_id}: buzz main created at {gh_tip[:7]} (bootstrapped from github)")
         post(f"`{repo_id}`: empty Buzz repo - created main at `{gh_tip[:7]}` from "
@@ -623,7 +646,7 @@ def reconcile(repo_id, gh_repo, token, state):
     if is_ancestor(d, buzz_tip, gh_tip):
         # GitHub ahead by a clean fast-forward: adopt it.
         try:
-            git(d, "push", buzz_url(repo_id), f"{gh_tip}:refs/heads/main")
+            git(d, "push", buzz_url(buzz_owner, repo_id), f"{gh_tip}:refs/heads/main")
         except RuntimeError as e:
             # Almost always the relay refusing the push because this repo still
             # has `push:owner` on main. Deliberately not matched on the denial
@@ -632,7 +655,7 @@ def reconcile(repo_id, gh_repo, token, state):
             # failure. Guessing which one it was would only add a way to guess
             # wrong.
             log(f"{repo_id}: buzz main refused the fast-forward ({e}); proposing instead")
-            propose_github_ahead(d, repo_id, gh_repo, gh_tip, state)
+            propose_github_ahead(d, buzz_owner, repo_id, gh_repo, gh_tip, state)
             return
         log(f"{repo_id}: buzz {buzz_tip[:7]} -> {gh_tip[:7]} (adopted from github)")
         post(f"`{repo_id}`: Buzz main fast-forwarded to `{gh_tip[:7]}` from GitHub "
@@ -657,9 +680,9 @@ def tick():
         # like "everything is in sync". Loud on purpose.
         log("ERROR no repos to mirror - check the App's grants and the `web` tags")
         return False
-    for repo_id, gh_repo, token in pairs:
+    for repo_id, buzz_owner, gh_repo, token in pairs:
         try:
-            reconcile(repo_id, gh_repo, token, state)
+            reconcile(buzz_owner, repo_id, gh_repo, token, state)
         except Exception as e:
             ok = False
             # Name the subsystem. "Looks like a GitHub outage but is actually a

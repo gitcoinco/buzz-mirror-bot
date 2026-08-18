@@ -121,7 +121,7 @@ GitHub. A halted mirror is not cosmetic — Buzz-side work stops reaching produc
 
 Discovered every run, never configured. The mirror set is the **intersection** of two opt-ins:
 
-1. the repo is **announced on Buzz** under `BUZZ_REPO_OWNER` with a GitHub URL in its `web` tag
+1. the repo is **announced on Buzz** by a pubkey listed in `BUZZ_REPO_OWNER` (comma-separated allowlist) with a GitHub URL in its `web` tag
 2. the repo is **granted to the GitHub App** — install with *Only select repositories* and tick it
 
 Enrolling a repo is (2). Unenrolling is unticking it. No env var, no redeploy.
@@ -323,7 +323,7 @@ in itself. The thing that would break the deadlock protection is pointing `GITHU
 | `GITHUB_OWNER` | the App installation to mirror, e.g. `irlfund`. **Required** |
 | `BUZZ_PRIVATE_KEY` | mirror-bot's nostr key. Must be a member of every bound channel |
 | `BUZZ_AUTH_TAG` | NIP-OA owner attestation |
-| `BUZZ_REPO_OWNER` | 64-char hex pubkey that announced the repos |
+| `BUZZ_REPO_OWNER` | announcing pubkey(s), 64-char hex, comma-separated. Repo ids are reserved to their creating key forever, so repos announced by different keys can only ever be followed as a list |
 | `MIRROR_ALERT_CHANNEL` | channel UUID for halt, recovery and adoption messages |
 | `GH_APP_TOKEN_CMD` | *optional.* Issuer path. Default `/usr/local/bin/gh-app-token` |
 | `MIRROR_INTERVAL_SECS` | loop mode only; ignored by `--once`. Default 60 |

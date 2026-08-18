@@ -25,7 +25,9 @@ os.environ.update(
     MIRROR_STATE_DIR=os.path.join(TMP, "state"),
     MIRROR_ALERT_CHANNEL="test-channel",
     GITHUB_APP_ID="1",
-    BUZZ_REPO_OWNER="deadbeef",
+    # Two allowlisted announcing keys, comma-separated (with the whitespace
+    # a human edits into an env file).
+    BUZZ_REPO_OWNER=" %s , %s " % ("1" * 64, "2" * 64),
 )
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sync  # noqa: E402
@@ -39,7 +41,8 @@ GITHUB = os.path.join(TMP, "github.git")
 
 # Route both "remotes" at local bare repos. The daemon's own git invocation,
 # fetch/push logic and ancestry checks are all exercised for real.
-sync.buzz_url = lambda repo_id: BUZZ
+OWNER1, OWNER2 = "1" * 64, "2" * 64
+sync.buzz_url = lambda buzz_owner, repo_id: BUZZ
 sync.github_url = lambda gh_repo, token: GITHUB
 
 
@@ -95,7 +98,7 @@ FAILED = False
 
 # 1. in sync -> no push, no message
 work, base = scenario("in sync")
-sync.reconcile("r", "o/r", "tok", {})
+sync.reconcile(OWNER1, "r", "o/r", "tok", {})
 check("github unchanged", tip(GITHUB) == base)
 check("silent", POSTS == [])
 
@@ -103,7 +106,7 @@ check("silent", POSTS == [])
 work, base = scenario("buzz ahead")
 new = commit(work, "buzz work")
 sh("git", "push", "-q", BUZZ, "main:main", cwd=work)
-sync.reconcile("r", "o/r", "tok", {})
+sync.reconcile(OWNER1, "r", "o/r", "tok", {})
 check("github fast-forwarded to buzz tip", tip(GITHUB) == new)
 check("silent on the happy path", POSTS == [])
 
@@ -113,7 +116,7 @@ work, base = scenario("github ahead")
 new = commit(work, "github work")
 sh("git", "push", "-q", GITHUB, "main:main", cwd=work)
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("buzz main fast-forwarded to github tip", tip(BUZZ) == new)
 check("not halted", not state.get("r", {}).get("halted"))
 check("said which way it went", any("from GitHub" in p for p in POSTS))
@@ -124,7 +127,7 @@ check("no proposal branch was needed", branches.strip() == "")
 # 3b. adopting converges the tips, so the next tick is silent - the notice is
 #     one per adopted push, not one per tick.
 POSTS.clear()
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("nothing more to say once the tips match", POSTS == [])
 
 # 3c. protection is per-repo: where the relay refuses the push to main, the
@@ -139,7 +142,7 @@ os.chmod(os.path.join(BUZZ, "hooks", "pre-receive"), 0o755)
 new = commit(work, "github work")
 sh("git", "push", "-q", GITHUB, "main:main", cwd=work)
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("buzz main NOT advanced when the push is refused", tip(BUZZ) == base)
 branches = subprocess.run(["git", "-C", BUZZ, "branch", "--list", "mirror/*"],
                           capture_output=True, text=True).stdout
@@ -151,7 +154,7 @@ check("named the deploy cost", any("frozen" in p for p in POSTS))
 # 3d. the fallback is sticky on the proposed sha, or a repo that stays ahead
 #     would alert on every tick.
 POSTS.clear()
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("sticky: no repeat message on the next tick", POSTS == [])
 
 # 4. diverged -> halt, nothing pushed anywhere
@@ -162,7 +165,7 @@ sh("git", "reset", "-q", "--hard", base, cwd=work)
 g = commit(work, "github side")
 sh("git", "push", "-qf", GITHUB, "main:main", cwd=work)
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("buzz main untouched", tip(BUZZ) == b)
 check("github main untouched", tip(GITHUB) == g)
 check("halted as diverged", state["r"]["halted"] == "diverged")
@@ -171,7 +174,7 @@ check("said it needs a human", any("human" in p for p in POSTS))
 # 5. recovery clears the halt and says so
 POSTS.clear()
 sh("git", "push", "-qf", GITHUB, f"{b}:main", cwd=work)
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("halt cleared", not state["r"].get("halted"))
 check("announced recovery", any("recovered" in p for p in POSTS))
 
@@ -182,14 +185,14 @@ sh("git", "-C", BUZZ, "update-ref", "-d", "refs/heads/main")
 new = commit(work, "github work")
 sh("git", "push", "-q", GITHUB, "main:main", cwd=work)
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("buzz main created at github tip", tip(BUZZ) == new)
 check("not halted", not state.get("r", {}).get("halted"))
 check("announced the bootstrap", any("empty Buzz repo" in p for p in POSTS))
 
 # 6b. converged now, so the next tick is silent
 POSTS.clear()
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("silent once the tips match", POSTS == [])
 
 # 6c. a stray branch on the empty buzz side (a proposal branch from an earlier
@@ -197,7 +200,7 @@ check("silent once the tips match", POSTS == [])
 work, base = scenario("empty buzz with a stray branch")
 sh("git", "-C", BUZZ, "update-ref", "-d", "refs/heads/main")
 sh("git", "push", "-q", BUZZ, "main:refs/heads/mirror/leftover", cwd=work)
-sync.reconcile("r", "o/r", "tok", {})
+sync.reconcile(OWNER1, "r", "o/r", "tok", {})
 check("buzz main still bootstrapped", tip(BUZZ) == base)
 
 # 6d. bootstrap refused by the relay -> same proposal fallback as 3c
@@ -209,7 +212,7 @@ with open(os.path.join(BUZZ, "hooks", "pre-receive"), "w") as f:
             'done\nexit 0\n')
 os.chmod(os.path.join(BUZZ, "hooks", "pre-receive"), 0o755)
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("buzz main NOT created when the push is refused", not has_main(BUZZ))
 branches = subprocess.run(["git", "-C", BUZZ, "branch", "--list", "mirror/*"],
                           capture_output=True, text=True).stdout
@@ -220,7 +223,7 @@ check("halted as github-ahead", state["r"]["halted"] == "github-ahead")
 work, base = scenario("empty github seeded from buzz")
 sh("git", "-C", GITHUB, "update-ref", "-d", "refs/heads/main")
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("github main created at buzz tip", tip(GITHUB) == base)
 check("not halted", not state.get("r", {}).get("halted"))
 check("silent, like the steady-state direction", POSTS == [])
@@ -230,12 +233,12 @@ work, base = scenario("github default branch is not main")
 sh("git", "push", "-q", GITHUB, "main:refs/heads/master", cwd=work)
 sh("git", "-C", GITHUB, "update-ref", "-d", "refs/heads/main")
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("no main was invented on github", not has_main(GITHUB))
 check("halted as github-no-main", state["r"]["halted"] == "github-no-main")
 check("said what to do about it", any("Rename the default branch" in p for p in POSTS))
 POSTS.clear()
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("sticky: no repeat message on the next tick", POSTS == [])
 
 # 9. both sides empty -> nothing to do, and not an error
@@ -243,7 +246,7 @@ work, base = scenario("both sides empty")
 sh("git", "-C", BUZZ, "update-ref", "-d", "refs/heads/main")
 sh("git", "-C", GITHUB, "update-ref", "-d", "refs/heads/main")
 state = {}
-sync.reconcile("r", "o/r", "tok", state)
+sync.reconcile(OWNER1, "r", "o/r", "tok", state)
 check("no refs created anywhere", not has_main(BUZZ) and not has_main(GITHUB))
 check("not halted", not state.get("r", {}).get("halted"))
 check("silent", POSTS == [])
@@ -302,30 +305,36 @@ check("each repo carries its own installation's token",
 # The Buzz announcement declares the pairing. Two of the three real repos have
 # a buzz repo-id that does NOT match the GitHub name, which is exactly why this
 # is read rather than guessed.
-BUZZ_REPOS = [
-    {"tags": [["d", "regenos-dev"], ["web", "https://github.com/irlfund/regenOS"]]},
-    {"tags": [["d", "local-almanac-mirror"],
-              ["web", "https://github.com/irlfund/local-almanac.git"]]},
-    {"tags": [["d", "agentic-engineering-infra"],
-              ["web", "https://github.com/irlfund/agentic-engineering-infra/"]]},
-    {"tags": [["d", "not-on-github"]]},                                  # no web tag
-    {"tags": [["d", "elsewhere"], ["web", "https://gitlab.com/x/y"]]},   # not GitHub
-    {"tags": [["d", "buzz-only"], ["web", "https://github.com/irlfund/never-granted"]]},
-]
-sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS)
+BUZZ_REPOS_BY_OWNER = {
+    OWNER1: [
+        {"tags": [["d", "regenos-dev"], ["web", "https://github.com/irlfund/regenOS"]]},
+        {"tags": [["d", "local-almanac-mirror"],
+                  ["web", "https://github.com/irlfund/local-almanac.git"]]},
+        {"tags": [["d", "not-on-github"]]},                                  # no web tag
+        {"tags": [["d", "elsewhere"], ["web", "https://gitlab.com/x/y"]]},   # not GitHub
+        {"tags": [["d", "buzz-only"], ["web", "https://github.com/irlfund/never-granted"]]},
+    ],
+    # A second announcing key (the repobot shape): its repos join the same set.
+    OWNER2: [
+        {"tags": [["d", "agentic-engineering-infra"],
+                  ["web", "https://github.com/irlfund/agentic-engineering-infra/"]]},
+    ],
+}
+sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS_BY_OWNER.get(a[-1], []))
 
 bz = sync.discover_buzz()
 check("pairing is read off the announcement, not guessed from the name",
-      bz["regenos-dev"] == "irlfund/regenOS")
+      bz["regenos-dev"] == (OWNER1, "irlfund/regenOS"))
 check("a trailing .git does not change the pairing",
-      bz["local-almanac-mirror"] == "irlfund/local-almanac")
-check("a trailing slash does not change the pairing",
-      bz["agentic-engineering-infra"] == "irlfund/agentic-engineering-infra")
+      bz["local-almanac-mirror"] == (OWNER1, "irlfund/local-almanac"))
+check("a trailing slash does not change the pairing, and a second allowlisted "
+      "owner's repos join the set carrying that owner",
+      bz["agentic-engineering-infra"] == (OWNER2, "irlfund/agentic-engineering-infra"))
 check("a repo with no web tag is not a candidate", "not-on-github" not in bz)
 check("a non-GitHub web tag is not a candidate", "elsewhere" not in bz)
 
 pairs, ok = sync.discover()
-got = {r: g for r, g, _ in pairs}
+got = {r: g for r, _, g, _ in pairs}
 check("a clean discovery reports ok", ok)
 check("mirrors exactly the repos that opted in on both sides",
       got == {"regenos-dev": "irlfund/regenOS",
@@ -337,7 +346,9 @@ check("a stranger's installation cannot inject a repo",
 check("granted but not announced is skipped",
       "some-org-repo" not in " ".join(got.values()))
 check("each pair carries its own account's token",
-      all(t == "tok-11" for _, _, t in pairs))
+      all(t == "tok-11" for _, _, _, t in pairs))
+check("each pair carries its announcing owner",
+      {r: o for r, o, _, _ in pairs}["agentic-engineering-infra"] == OWNER2)
 
 # The deployed shape gets an installation token from the issuer instead of the
 # PEM, and that token must be installation-WIDE: narrowing it to a repo list
@@ -356,17 +367,22 @@ sync.INSTALL_TOKEN = ""
 # Two buzz repos claiming one GitHub repo would take turns fast-forwarding the
 # same main from unrelated histories. There is no safe guess about which wins,
 # so both are dropped and the run fails rather than thrashing quietly.
-CONTESTED = BUZZ_REPOS + [
-    {"tags": [["d", "regenos-dupe"], ["web", "https://github.com/irlfund/regenOS"]]},
-]
-sync.buzz_cli = lambda *a: json.dumps(CONTESTED)
+CONTESTED_BY_OWNER = {
+    OWNER1: BUZZ_REPOS_BY_OWNER[OWNER1],
+    # The dupe claim arriving from a DIFFERENT allowlisted owner must be
+    # caught the same way as one from the same owner.
+    OWNER2: BUZZ_REPOS_BY_OWNER[OWNER2] + [
+        {"tags": [["d", "regenos-dupe"], ["web", "https://github.com/irlfund/regenOS"]]},
+    ],
+}
+sync.buzz_cli = lambda *a: json.dumps(CONTESTED_BY_OWNER.get(a[-1], []))
 pairs, ok = sync.discover()
-names = [r for r, _, _ in pairs]
+names = [r for r, _, _, _ in pairs]
 check("a contested GitHub repo fails the run", not ok)
 check("both claimants are dropped, not just the loser",
       "regenos-dev" not in names and "regenos-dupe" not in names)
 check("uncontested repos still mirror", "local-almanac-mirror" in names)
-sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS)
+sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS_BY_OWNER.get(a[-1], []))
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +452,7 @@ sync.run = real_run
 
 print("\n--- --once exit status")
 
-sync.reconcile = lambda repo_id, gh_repo, tok, st: None
+sync.reconcile = lambda buzz_owner, repo_id, gh_repo, tok, st: None
 sync.load_state = lambda: {}
 sync.save_state = lambda s: None
 touched = []
@@ -446,7 +462,7 @@ check("clean run exits 0", sync.main() == 0)
 check("clean run recorded success", len(touched) == 1)
 
 
-def boom(repo_id, gh_repo, tok, st):
+def boom(buzz_owner, repo_id, gh_repo, tok, st):
     raise RuntimeError("api.github.com exploded")
 
 
@@ -457,7 +473,7 @@ check("failed run did NOT record success", touched == [])
 check("failure is attributed to github", any("github-auth-failed" in p for p in POSTS))
 
 
-def boom_500(repo_id, gh_repo, tok, st):
+def boom_500(buzz_owner, repo_id, gh_repo, tok, st):
     raise RuntimeError("fatal: unable to access 'https://github.com/o/r.git/': "
                        "The requested URL returned error: 500")
 
@@ -475,7 +491,7 @@ check("but is labelled unavailable, not an auth failure",
 
 # Discovering nothing must fail loudly: an empty mirror set reads exactly like
 # "everything is in sync", and it is the shape a mis-click produces.
-sync.reconcile = lambda repo_id, gh_repo, tok, st: None
+sync.reconcile = lambda buzz_owner, repo_id, gh_repo, tok, st: None
 sync.discover = lambda: ([], True)
 touched.clear()
 check("discovering no repos exits non-zero", sync.main() == 1)
