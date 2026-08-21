@@ -230,10 +230,19 @@ def api(path, token, method="GET", scheme="Bearer"):
     entirely - out of tick(), `ERROR tick failed`, exit 1, no halt, no post. A
     truncated response body (IncompleteRead) is the one that started this, but
     naming it alone left BadStatusLine, LineTooLong, InvalidURL and
-    UnknownProtocol still escaping; a proxy with no backend answering with a
-    garbage status line raises BadStatusLine, and that is producer four in
-    AMBIGUOUS_404. The family is caught, not one member of it, because no
-    pattern can help an exception that is never caught.
+    UnknownProtocol still escaping. Any of them is the same event as the one
+    that started this: api.github.com answered badly or not at all. The family
+    is caught, not one member of it, because no pattern can help an exception
+    that is never caught.
+
+    An earlier version of this paragraph cited Coolify's proxy with no backend
+    as the BadStatusLine case. That example is wrong twice, and opsbot caught
+    both: the proxy is producer THREE in AMBIGUOUS_404, not four, and it cannot
+    reach this function at all. The one urlopen below goes to GITHUB_API; the
+    relay is reached through the buzz CLI as a subprocess and through git, so a
+    proxy answering with garbage arrives as a RuntimeError out of run(), never
+    as an HTTPException. Justifying a handler with a failure from the other
+    side of the system is the mirror of the bug this branch keeps finding.
 
     Catching wider does not retry wider: TRANSIENT still decides, so a member
     whose wording is not transient re-raises on the first attempt, which is
