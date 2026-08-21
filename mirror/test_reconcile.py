@@ -717,6 +717,50 @@ check("urllib's truncation wording is transient",
 
 API_ATTEMPTS.clear()
 
+
+def urlopen_bad_status_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 2:
+        # Synthetic wording, and labelled as such: no BadStatusLine observed in
+        # the wild words itself transiently, so the message is chosen to make
+        # the two catch clauses disagree. What is being tested is the clause,
+        # not the wording - the wordings are measured further down.
+        raise http.client.BadStatusLine("relay error 503")
+    return FakeResp(b'{"ok": true}')
+
+
+# IncompleteRead was one member of a family. BadStatusLine, LineTooLong,
+# InvalidURL and UnknownProtocol are HTTPException and not OSError too, so
+# naming IncompleteRead alone left them escaping api() exactly as it did.
+# BadStatusLine is what a proxy with no backend raises, which is producer four
+# in AMBIGUOUS_404. Mutating the clause back to `except (OSError,
+# http.client.IncompleteRead)` fails this by raising, not by looping.
+urllib.request.urlopen = urlopen_bad_status_then_ok
+check("a garbage status line is caught by the family, not by one subclass",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it cleared on the second attempt", len(API_ATTEMPTS) == 2)
+API_ATTEMPTS.clear()
+
+
+def urlopen_bad_status_forever(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    raise http.client.BadStatusLine("<html>hello</html>")
+
+
+# The other half of the clause: catching wider is not retrying wider. A member
+# whose wording is not transient still leaves on the first attempt, which is
+# where it left this function before the clause was widened.
+urllib.request.urlopen = urlopen_bad_status_forever
+try:
+    sync.api("/x", "tok")
+    raised = False
+except http.client.BadStatusLine:
+    raised = True
+check("a non-transient HTTPException still leaves on the first attempt",
+      raised and len(API_ATTEMPTS) == 1)
+
+API_ATTEMPTS.clear()
+
 # git and urllib word the same two events differently, and git is the client
 # that does all the mirror's real traffic. Both measured against a stub server
 # on 2026-08-21 rather than quoted: a far side that accepts and hangs up, and

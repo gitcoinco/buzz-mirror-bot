@@ -225,13 +225,21 @@ def api(path, token, method="GET", scheme="Bearer"):
     urllib.error.HTTPError and URLError both subclass OSError; a malformed body
     raises ValueError and is not retried, which is right - it will not clear.
 
-    IncompleteRead is the exception to that tidy story. A truncated response
-    body raises http.client.IncompleteRead, which subclasses HTTPException and
-    NOT OSError, so it escaped this handler entirely - out of tick(), `ERROR
-    tick failed`, exit 1, no halt, no post. It is caught explicitly because no
-    pattern can help an exception that is never caught. Retrying it is safe on
-    the same grounds as everything else here: the listing is a GET and the mint
-    is idempotent in effect.
+    http.client.HTTPException is the exception to that tidy story. It does NOT
+    subclass OSError, so every member of that family escaped this handler
+    entirely - out of tick(), `ERROR tick failed`, exit 1, no halt, no post. A
+    truncated response body (IncompleteRead) is the one that started this, but
+    naming it alone left BadStatusLine, LineTooLong, InvalidURL and
+    UnknownProtocol still escaping; a proxy with no backend answering with a
+    garbage status line raises BadStatusLine, and that is producer four in
+    AMBIGUOUS_404. The family is caught, not one member of it, because no
+    pattern can help an exception that is never caught.
+
+    Catching wider does not retry wider: TRANSIENT still decides, so a member
+    whose wording is not transient re-raises on the first attempt, which is
+    where it left this function before. Retrying the ones that do match is safe
+    on the same grounds as everything else here: the listing is a GET and the
+    mint is idempotent in effect.
     """
     req = urllib.request.Request(
         f"{GITHUB_API}{path}",
@@ -246,7 +254,7 @@ def api(path, token, method="GET", scheme="Bearer"):
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read())
-        except (OSError, http.client.IncompleteRead) as e:
+        except (OSError, http.client.HTTPException) as e:
             if attempt == GIT_TRIES or not TRANSIENT.search(str(e)):
                 raise
             log(f"WARN transient github api failure (attempt {attempt}/"
