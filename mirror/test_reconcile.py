@@ -35,10 +35,12 @@ import sync  # noqa: E402
 POSTS = []
 sync.post = lambda text: POSTS.append(text)
 sync.open_pr = lambda *a, **k: "buzz://pr/test"
-# The discovery tests below replace buzz_cli with a canned-JSON lambda. Keep the
-# real one: the retry tests need a buzz_cli that actually reaches run(), or they
-# would pass against the stub without exercising anything.
+# The discovery tests below replace buzz_cli and api with stubs, for the rest of
+# the file. Keep the real ones: the retry tests need implementations that
+# actually reach run()/urlopen, or they pass against a stub having exercised
+# nothing. This bit me once already.
 REAL_BUZZ_CLI = sync.buzz_cli
+REAL_API = sync.api
 
 BUZZ = os.path.join(TMP, "buzz.git")
 GITHUB = os.path.join(TMP, "github.git")
@@ -535,6 +537,81 @@ try:
 except RuntimeError:
     raised = True
 check("a write is not retried", raised and len(RUN_CALLS) == 1)
+
+
+# --- the GitHub half of discovery ------------------------------------------
+# api() is called only from paginate() and the token mint, both inside
+# discovery and neither inside reconcile(). So an API failure took the same
+# path a refusing relay used to: out of tick(), no halt(), no post, no later
+# recovery. It also means tick()'s `github-unavailable` branch is unreachable
+# from the API - only git-over-https can raise into it.
+
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+
+# urllib does not phrase a 5xx the way curl does, so the git-shaped half of
+# TRANSIENT never matched here. This is the assertion that keeps both spellings.
+check("urllib's 5xx wording is transient",
+      bool(sync.TRANSIENT.search(str(
+          urllib.error.HTTPError("u", 502, "Bad Gateway", {}, None)))))
+check("curl's 5xx wording still is",
+      bool(sync.TRANSIENT.search(
+          "The requested URL returned error: 502")))
+check("a 404 is not transient",
+      not sync.TRANSIENT.search(str(
+          urllib.error.HTTPError("u", 404, "Not Found", {}, None))))
+
+sync.api = REAL_API
+REAL_URLOPEN = urllib.request.urlopen
+API_ATTEMPTS = []
+
+
+class FakeResp:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def urlopen_502_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 3:
+        raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, None)
+    return FakeResp(b'{"ok": true}')
+
+
+urllib.request.urlopen = urlopen_502_then_ok
+check("a github api 5xx is retried until it clears",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it took all three attempts", len(API_ATTEMPTS) == 3)
+
+API_ATTEMPTS.clear()
+
+
+def urlopen_404(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+
+# A 404 cannot clear on a second attempt, so it must halt immediately rather
+# than spend GIT_TRIES * GIT_RETRY_DELAY seconds first.
+urllib.request.urlopen = urlopen_404
+try:
+    sync.api("/x", "tok")
+    raised = False
+except urllib.error.HTTPError:
+    raised = True
+check("a github api 404 is not retried", raised and len(API_ATTEMPTS) == 1)
+
+urllib.request.urlopen = REAL_URLOPEN
+sync.api = fake_api
 
 # Put the canned-JSON discovery stub back: everything below drives main(), which
 # reaches discover_buzz(), and the real buzz_cli would shell out to `buzz`.

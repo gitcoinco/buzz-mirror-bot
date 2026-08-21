@@ -205,6 +205,25 @@ def app_jwt():
 
 
 def api(path, token, method="GET", scheme="Bearer"):
+    """A GitHub API call, retried on a transient failure like git() and
+    buzz_read().
+
+    Both call sites are in discovery - the installation listing in paginate()
+    and the token mint below - and neither is in reconcile(). So a GitHub 5xx
+    here takes the same path a refusing relay used to: straight out of tick(),
+    `ERROR tick failed`, exit 1, no halt() and therefore no post and no later
+    recovery message. It also means the `github-unavailable` branch in tick()
+    is unreachable from the API; only git-over-https can raise into it.
+
+    The token mint is a POST, and it is retried anyway: it creates a fresh
+    short-lived installation token, so a duplicate is an unused token that
+    expires in an hour, not a duplicated side effect. That is the reason
+    buzz_read exists for the relay's reads but its writes are left alone -
+    `messages send` and `pr open` are not harmless to repeat.
+
+    urllib.error.HTTPError and URLError both subclass OSError; a malformed body
+    raises ValueError and is not retried, which is right - it will not clear.
+    """
     req = urllib.request.Request(
         f"{GITHUB_API}{path}",
         method=method,
@@ -214,8 +233,16 @@ def api(path, token, method="GET", scheme="Bearer"):
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    for attempt in range(1, GIT_TRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except OSError as e:
+            if attempt == GIT_TRIES or not TRANSIENT.search(str(e)):
+                raise
+            log(f"WARN transient github api failure (attempt {attempt}/"
+                f"{GIT_TRIES}), retrying in {GIT_RETRY_DELAY}s: {str(e)[:200]}")
+            time.sleep(GIT_RETRY_DELAY)
 
 
 def paginate(path, token, key=None):
@@ -421,8 +448,15 @@ GIT_COMMON = [
 # permanently wrong host or port too; the cost of that is one halt delayed by
 # GIT_TRIES * GIT_RETRY_DELAY seconds, which is cheaper than mislabelling an
 # outage as an auth failure.
+#
+# Two spellings of the same 5xx, because two clients report it. `returned
+# error: 5\d\d` is curl's, which is what git surfaces; `HTTP Error 5\d\d` is
+# urllib's, which is what api() raises. Matching only curl's is how this
+# pattern silently did nothing on the GitHub API side - a 502 from
+# api.github.com is the likeliest failure there and it went unretried.
 TRANSIENT = re.compile(
-    r"returned error: 5\d\d|connection reset|timed out"
+    r"returned error: 5\d\d|HTTP Error 5\d\d"
+    r"|connection reset|timed out"
     r"|connection refused|failed to connect",
     re.IGNORECASE)
 
