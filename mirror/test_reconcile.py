@@ -463,6 +463,26 @@ except RuntimeError:
 check("a persistent 5xx still raises after the last attempt",
       raised and len(RUN_CALLS) == sync.GIT_TRIES)
 
+RUN_CALLS.clear()
+
+
+def refused_then_ok(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError(
+            "git failed (128): fatal: unable to access "
+            "'https://buzz.gitcoin.co/git/o/r.git/': Failed to connect to "
+            "buzz.gitcoin.co port 443 after 0 ms: Connection refused")
+    return "ok"
+
+
+# A host restarting refuses connections. It was not retried until 2026-08-21,
+# so a relay restart halted the mirror on the first failed operation.
+sync.run = refused_then_ok
+check("a refused connection is retried until it clears",
+      sync.git("/tmp", "fetch") == "ok")
+check("it took all three attempts", len(RUN_CALLS) == 3)
+
 sync.run = real_run
 
 
@@ -491,6 +511,25 @@ POSTS.clear(); touched.clear()
 check("failed run exits non-zero", sync.main() == 1)
 check("failed run did NOT record success", touched == [])
 check("failure is attributed to github", any("github-auth-failed" in p for p in POSTS))
+
+
+def boom_refused(buzz_owner, repo_id, gh_repo, tok, st):
+    raise RuntimeError("git failed (128): fatal: unable to access "
+                       "'https://buzz.gitcoin.co/git/o/r.git/': Failed to "
+                       "connect to buzz.gitcoin.co port 443 after 0 ms: "
+                       "Connection refused")
+
+
+# The relay restarting must not be reported as a revoked key. Before
+# 2026-08-21 it was: connection-refused missed TRANSIENT, so `tick()` fell to
+# the else arm and posted `buzz-auth-failed`. The halt is correct; the label
+# is what a human reads at 3am, and these two want opposite responses.
+sync.reconcile = boom_refused
+POSTS.clear(); touched.clear()
+check("a refused relay still fails the run", sync.main() == 1)
+check("a relay restart is unavailable, not an auth failure",
+      any("buzz-unavailable" in p for p in POSTS)
+      and not any("auth-failed" in p for p in POSTS))
 
 
 def boom_500(buzz_owner, repo_id, gh_repo, tok, st):

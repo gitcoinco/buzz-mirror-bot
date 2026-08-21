@@ -405,11 +405,25 @@ GIT_COMMON = [
 
 
 # Failure classes worth a second attempt within the tick: a 5xx from either
-# git host, a reset connection, a timeout. Auth denials and non-fast-forward
-# rejections are deliberately absent - retrying those cannot succeed and would
-# only delay the halt.
-TRANSIENT = re.compile(r"returned error: 5\d\d|connection reset|timed out",
-                       re.IGNORECASE)
+# git host, a reset connection, a timeout, a refused or unreachable host. Auth
+# denials and non-fast-forward rejections are deliberately absent - retrying
+# those cannot succeed and would only delay the halt.
+#
+# A host that is restarting refuses connections, and until 2026-08-21 that was
+# neither retried nor labelled honestly: `tick()` reads this pattern to choose
+# between `*-unavailable` and `*-auth-failed`, so a relay restart was reported
+# as `buzz-auth-failed` - the label for a revoked key, which is the one thing
+# the branch there exists to keep apart from an outage. Both halves are fixed
+# by matching it here.
+#
+# `failed to connect` also covers unreachable and no-route. It can match a
+# permanently wrong host or port too; the cost of that is one halt delayed by
+# GIT_TRIES * GIT_RETRY_DELAY seconds, which is cheaper than mislabelling an
+# outage as an auth failure.
+TRANSIENT = re.compile(
+    r"returned error: 5\d\d|connection reset|timed out"
+    r"|connection refused|failed to connect",
+    re.IGNORECASE)
 
 GIT_TRIES = 3        # attempts per git operation within one tick
 GIT_RETRY_DELAY = 5  # seconds between attempts
