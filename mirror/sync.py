@@ -449,13 +449,24 @@ GIT_COMMON = [
 # GIT_TRIES * GIT_RETRY_DELAY seconds, which is cheaper than mislabelling an
 # outage as an auth failure.
 #
-# Two spellings of the same 5xx, because two clients report it. `returned
-# error: 5\d\d` is curl's, which is what git surfaces; `HTTP Error 5\d\d` is
-# urllib's, which is what api() raises. Matching only curl's is how this
-# pattern silently did nothing on the GitHub API side - a 502 from
-# api.github.com is the likeliest failure there and it went unretried.
+# THREE spellings of the same 5xx, because three clients report it and each
+# words it differently:
+#
+#   returned error: 503   curl, via git
+#   HTTP Error 503        urllib, via api()
+#   relay error 503       reqwest, via the buzz CLI
+#
+# Matching only curl's is how this pattern silently did nothing on the GitHub
+# API side. Adding urllib's and stopping there is how it would silently have
+# done nothing on the relay side. Measured by opsbot against a live relay,
+# 2026-08-21. If a fourth client ever reports here, assume its wording is a
+# fourth spelling until someone has run it.
+#
+# The relay half is belt-and-braces: buzz_read prefers the CLI's own
+# `retryable` field and only falls back to this pattern when there is no JSON
+# to read. See cli_retryable().
 TRANSIENT = re.compile(
-    r"returned error: 5\d\d|HTTP Error 5\d\d"
+    r"returned error: 5\d\d|HTTP Error 5\d\d|relay error 5\d\d"
     r"|connection reset|timed out"
     r"|connection refused|failed to connect",
     re.IGNORECASE)
@@ -463,6 +474,30 @@ TRANSIENT = re.compile(
 # Named for git because that is where they started; they now also govern the
 # relay read in discover_buzz(). Kept as one pair on purpose: both are the same
 # question, "did the far side answer this tick".
+# `repository not found` is the relay's GENERIC DENIAL: a coordinate that does
+# not resolve, and a caller who is not a member of the repo's bound channel,
+# are deliberately rendered identically. Coolify's proxy with no backend behind
+# it is a third thing that can produce it, and none of the three carries a
+# status code. Because the URL contains buzz.gitcoin.co, tick() lands all of
+# them on `buzz-auth-failed`, which names only one.
+#
+# The ambiguity is not fixable from this side, so the halt says so instead. Two
+# agents spent an hour on it from opposite ends on 2026-08-21, each confidently
+# naming a different one of the three.
+REPO_NOT_FOUND = re.compile(r"repository .*not found|repository not found",
+                            re.IGNORECASE)
+AMBIGUOUS_404 = (
+    "\n\n`repository not found` is ambiguous by design. It means one of: the "
+    "repo id or owner has changed and this remote is stale; this key is not a "
+    "member of the repo's bound channel; or the relay is up but its proxy has "
+    "no backend. The label above says auth because the URL is a Buzz one, not "
+    "because the key was checked.\n\n"
+    "In that order of cost to check:\n"
+    "1. `buzz repos get --id <id>` and compare the `clone` tag to the remote\n"
+    "2. `buzz channels members --channel <the announcement's buzz-channel>`\n"
+    "3. whether the relay was restarting at this timestamp"
+)
+
 GIT_TRIES = 3        # attempts per network operation within one tick
 GIT_RETRY_DELAY = 5  # seconds between attempts
 
@@ -548,6 +583,43 @@ def buzz_cli(*args):
     return run(["buzz", *args])
 
 
+def cli_retryable(err):
+    """The buzz CLI's own verdict on its failure, or None if it did not give one.
+
+    The CLI prints a structured error to stderr and run() attaches stderr, so
+    the JSON is inside the RuntimeError text:
+
+        {"error":"relay_error","message":"relay error 503: ","retryable":true}
+
+    Preferred over TRANSIENT for this one caller because it is a stated contract
+    rather than a guess at prose. The prose guess is genuinely fragile here: a
+    5xx has three renderings depending on which client saw it - `returned error:
+    503` from curl through git, `HTTP Error 503` from urllib in api(), and
+    `relay error 503` from reqwest in the CLI. Two of those were in the pattern
+    and the third was not, which is the hole opsbot measured on 2026-08-21.
+
+    Deferring to `retryable` wholesale, including for DNS, which the CLI reports
+    as retryable and the git side does not retry. The two paths disagree on
+    purpose: on the git side there is no verdict to read and prose is all there
+    is, so `could not resolve host` is excluded to keep a permanently wrong host
+    from costing GIT_TRIES * GIT_RETRY_DELAY on every tick. Here the CLI has
+    already answered, and a carve-out would mean overriding its contract to
+    save ten seconds on a misconfiguration. If that turns out to be wrong, the
+    carve-out belongs here as one explicit branch, not as a change of policy.
+
+    Returns None when there is no JSON to read - a panic, a truncated stream -
+    and the caller falls back to TRANSIENT.
+    """
+    text = str(err)
+    lo, hi = text.find("{"), text.rfind("}")
+    if lo == -1 or hi < lo:
+        return None
+    try:
+        return json.loads(text[lo:hi + 1]).get("retryable")
+    except (ValueError, AttributeError):
+        return None
+
+
 def buzz_read(*args):
     """A READ-ONLY buzz call, retried like git on a transient relay failure.
 
@@ -566,12 +638,18 @@ def buzz_read(*args):
 
     A restart that clears inside GIT_TRIES * GIT_RETRY_DELAY now costs nothing
     at all. A longer one still lands there; that shape is aei issue 9230a23d.
+
+    Retries on the CLI's own `retryable` flag where it gives one, falling back
+    to TRANSIENT where it does not - see cli_retryable().
     """
     for attempt in range(1, GIT_TRIES + 1):
         try:
             return buzz_cli(*args)
         except RuntimeError as e:
-            if attempt == GIT_TRIES or not TRANSIENT.search(str(e)):
+            verdict = cli_retryable(e)
+            if verdict is None:
+                verdict = bool(TRANSIENT.search(str(e)))
+            if attempt == GIT_TRIES or not verdict:
                 raise
             log(f"WARN transient relay failure (attempt {attempt}/{GIT_TRIES}), "
                 f"retrying in {GIT_RETRY_DELAY}s: {str(e)[:200]}")
@@ -777,14 +855,18 @@ def tick():
             # reason, so a real auth failure arriving while a 5xx halt is live
             # must post as its own message, not be swallowed by it.
             msg = str(e)
-            transient = bool(TRANSIENT.search(msg))
+            verdict = cli_retryable(e)
+            transient = bool(TRANSIENT.search(msg)) if verdict is None else verdict
             if "buzz.gitcoin.co" in msg or "not a relay member" in msg:
                 reason = "buzz-unavailable" if transient else "buzz-auth-failed"
             elif "github.com" in msg or "api.github.com" in msg:
                 reason = "github-unavailable" if transient else "github-auth-failed"
             else:
                 reason = "reconcile-failed"
-            halt(state, repo_id, reason, f"```\n{msg[:800]}\n```")
+            detail = f"```\n{msg[:800]}\n```"
+            if REPO_NOT_FOUND.search(msg):
+                detail += AMBIGUOUS_404
+            halt(state, repo_id, reason, detail)
     if ok:
         touch_last_success()
     return ok

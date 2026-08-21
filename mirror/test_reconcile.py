@@ -538,6 +538,87 @@ except RuntimeError:
     raised = True
 check("a write is not retried", raised and len(RUN_CALLS) == 1)
 
+RUN_CALLS.clear()
+
+# --- the CLI's own retryable flag -------------------------------------------
+# A 5xx has three renderings and the pattern only ever knew two at a time. The
+# CLI states its verdict, so for this one caller we read it instead of guessing
+# at prose. run() attaches stderr, and the CLI prints its JSON there.
+CLI_503 = ('buzz failed (2): {"error":"relay_error","message":"relay error 503: ",'
+           '"retryable":true}')
+CLI_404 = ('buzz failed (2): {"error":"relay_error","message":"relay error 404: '
+           '404 page not found","retryable":false}')
+
+check("the CLI's retryable flag is read", sync.cli_retryable(RuntimeError(CLI_503)) is True)
+check("and its refusal is read too", sync.cli_retryable(RuntimeError(CLI_404)) is False)
+check("no JSON means no verdict, so TRANSIENT decides",
+      sync.cli_retryable(RuntimeError("buzz failed (101): panicked at 'x'")) is None)
+
+
+def cli_503_then_ok(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError(CLI_503)
+    return "ok"
+
+
+def cli_404_always(args, **kw):
+    RUN_CALLS.append(args)
+    raise RuntimeError(CLI_404)
+
+
+sync.buzz_cli = REAL_BUZZ_CLI
+sync.run = cli_503_then_ok
+check("a relay 5xx is retried on the CLI's word",
+      sync.buzz_read("repos", "list") == "ok" and len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+
+# The case where the CLI and the pattern DISAGREE, which is the only thing that
+# proves buzz_read prefers the verdict. DNS: the CLI calls it retryable, the
+# pattern does not match it, and the git side deliberately does not retry it.
+# Deferring to the CLI here is a decision, not an oversight - see cli_retryable.
+CLI_DNS = ('buzz failed (2): {"error":"network_error","message":"network error: '
+           'dns error: failed to lookup address information","retryable":true}')
+
+
+def cli_dns_then_ok(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError(CLI_DNS)
+    return "ok"
+
+
+check("the pattern alone would not retry DNS",
+      not sync.TRANSIENT.search(CLI_DNS))
+sync.run = cli_dns_then_ok
+check("but the CLI's verdict wins, so it is retried",
+      sync.buzz_read("repos", "list") == "ok" and len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+sync.run = cli_404_always
+try:
+    sync.buzz_read("repos", "list")
+    raised = False
+except RuntimeError:
+    raised = True
+check("a relay 404 is not retried, also on the CLI's word",
+      raised and len(RUN_CALLS) == 1)
+
+# The regex is the fallback for when there is no JSON, so it needs the third
+# spelling too. reqwest says `relay error 503`; curl and urllib say neither.
+check("the third 5xx spelling is in the pattern",
+      bool(sync.TRANSIENT.search("relay error 503: ")))
+
+# `repository not found` is the relay's generic denial and a proxy with no
+# backend renders the same way. The halt cannot resolve that, so it must say so.
+check("an ambiguous 404 is flagged as ambiguous",
+      bool(sync.REPO_NOT_FOUND.search(
+          "git failed (128): remote: repository not found")))
+check("an unrelated failure is not",
+      not sync.REPO_NOT_FOUND.search("git failed (128): remote: requires Owner role"))
+
+RUN_CALLS.clear()
 
 # --- the GitHub half of discovery ------------------------------------------
 # api() is called only from paginate() and the token mint, both inside
@@ -663,6 +744,24 @@ check("a refused relay still fails the run", sync.main() == 1)
 check("a relay restart is unavailable, not an auth failure",
       any("buzz-unavailable" in p for p in POSTS)
       and not any("auth-failed" in p for p in POSTS))
+
+
+def boom_not_found(buzz_owner, repo_id, gh_repo, tok, st):
+    raise RuntimeError("git failed (128): remote: repository not found\nfatal: "
+                       "repository 'https://buzz.gitcoin.co/git/o/r.git/' not found")
+
+
+# The wiring check for the ambiguity note: `repository not found` is the relay's
+# generic denial, a stale coordinate and a proxy with no backend render the
+# same, and none of the three carries a status code. tick() still has to label
+# it `buzz-auth-failed` because the URL is a Buzz one, so the halt has to say
+# that the label named one of three possibilities rather than a checked fact.
+sync.reconcile = boom_not_found
+POSTS.clear(); touched.clear()
+check("an ambiguous 404 still halts", sync.main() == 1)
+check("and the halt says the auth label was not a checked fact",
+      any("ambiguous by design" in p for p in POSTS)
+      and any("buzz channels members" in p for p in POSTS))
 
 
 def boom_500(buzz_owner, repo_id, gh_repo, tok, st):
