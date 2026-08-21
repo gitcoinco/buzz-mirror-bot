@@ -697,6 +697,46 @@ check("and it cleared on the second attempt", len(API_ATTEMPTS) == 2)
 API_ATTEMPTS.clear()
 
 
+def urlopen_truncated_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 2:
+        raise http.client.IncompleteRead(b"short", 495)
+    return FakeResp(b'{"ok": true}')
+
+
+# The one that no pattern could have fixed. IncompleteRead subclasses
+# HTTPException, not OSError, so before this it escaped api()'s handler
+# entirely: out of tick(), exit 1, no halt and no post. Mutating the except
+# clause back to `except OSError` fails this check by raising, not by looping.
+urllib.request.urlopen = urlopen_truncated_then_ok
+check("a truncated github response body is caught and retried",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it cleared on the second attempt", len(API_ATTEMPTS) == 2)
+check("urllib's truncation wording is transient",
+      bool(sync.TRANSIENT.search(str(http.client.IncompleteRead(b"short", 495)))))
+
+API_ATTEMPTS.clear()
+
+# git and urllib word the same two events differently, and git is the client
+# that does all the mirror's real traffic. Both measured against a stub server
+# on 2026-08-21 rather than quoted: a far side that accepts and hangs up, and
+# one that answers and truncates.
+check("git's wording for a hangup mid-request is transient",
+      bool(sync.TRANSIENT.search(
+          "fatal: unable to access 'https://buzz.gitcoin.co/git/o/r.git/': "
+          "Empty reply from server")))
+check("git's wording for a truncated body is transient",
+      bool(sync.TRANSIENT.search(
+          "fatal: unable to access 'https://github.com/o/r.git/': "
+          "end of response with 495 bytes missing")))
+# The one deliberately left out: a mid-stream push failure and a server-side
+# hook rejection render identically, so retrying it would triple a real
+# rejection.
+check("a hung-up remote end is NOT transient",
+      not sync.TRANSIENT.search(
+          "fatal: the remote end hung up unexpectedly"))
+
+
 def urlopen_404(req, timeout=None):
     API_ATTEMPTS.append(req.full_url)
     raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)

@@ -88,6 +88,7 @@ pure latency optimisation without touching it.
 """
 
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -223,6 +224,14 @@ def api(path, token, method="GET", scheme="Bearer"):
 
     urllib.error.HTTPError and URLError both subclass OSError; a malformed body
     raises ValueError and is not retried, which is right - it will not clear.
+
+    IncompleteRead is the exception to that tidy story. A truncated response
+    body raises http.client.IncompleteRead, which subclasses HTTPException and
+    NOT OSError, so it escaped this handler entirely - out of tick(), `ERROR
+    tick failed`, exit 1, no halt, no post. It is caught explicitly because no
+    pattern can help an exception that is never caught. Retrying it is safe on
+    the same grounds as everything else here: the listing is a GET and the mint
+    is idempotent in effect.
     """
     req = urllib.request.Request(
         f"{GITHUB_API}{path}",
@@ -237,7 +246,7 @@ def api(path, token, method="GET", scheme="Bearer"):
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read())
-        except OSError as e:
+        except (OSError, http.client.IncompleteRead) as e:
             if attempt == GIT_TRIES or not TRANSIENT.search(str(e)):
                 raise
             log(f"WARN transient github api failure (attempt {attempt}/"
@@ -468,13 +477,44 @@ GIT_COMMON = [
 # GitHub restart mid-request is exactly the event this pattern exists for.
 # Found by judgebot, 2026-08-21; the string is measured, not quoted from docs.
 #
+# Five review rounds added one spelling each, so the sixth and seventh came
+# from running the ENUMERATION instead: drive every client this pattern reads
+# for against the same two events, and write down what each one says. Stub
+# server, measured 2026-08-21, `curl 7.88` / `git 2.47` / `python 3.13`:
+#
+#   far side accepts the request and hangs up without answering
+#     git     unable to access '...': Empty reply from server
+#     urllib  Remote end closed connection without response
+#     CLI     Connection reset by peer (os error 104), retryable:true
+#
+#   far side answers, then truncates the body
+#     git     end of response with 495 bytes missing
+#     urllib  IncompleteRead(5 bytes read, 495 more expected)
+#
+# Note which half was uncovered: git, the client that does all the mirror's
+# real traffic, on the event judgebot found on the urllib side. `Empty reply
+# from server` carries no status code and does not say "reset", so with
+# buzz.gitcoin.co in the URL it landed on `buzz-auth-failed` - the 13:34
+# mislabel again, arriving by the busiest path. Found by opsbot, 2026-08-21.
+#
+# The truncation pair is worse than a missing spelling: IncompleteRead
+# subclasses http.client.HTTPException, NOT OSError, so api() did not catch it
+# at all and no pattern could have helped. Fixed there; see api().
+#
+# NOT in, and deliberately: `the remote end hung up unexpectedly`. A push that
+# dies mid-stream renders that way, but so does a server-side hook that
+# rejects, and retrying that triples a real rejection. Nobody has reproduced it
+# cleanly against a stub, so it stays out until someone has.
+#
 # The relay half is belt-and-braces: buzz_read prefers the CLI's own
 # `retryable` field and only falls back to this pattern when there is no JSON
 # to read. See cli_retryable().
 TRANSIENT = re.compile(
     r"returned error: 5\d\d|HTTP Error 5\d\d|relay error 5\d\d"
     r"|connection reset|closed connection without response|timed out"
-    r"|connection refused|failed to connect",
+    r"|connection refused|failed to connect"
+    r"|empty reply from server|end of response with \d+ bytes missing"
+    r"|incompleteread",
     re.IGNORECASE)
 
 # Named for git because that is where they started; they now also govern the
