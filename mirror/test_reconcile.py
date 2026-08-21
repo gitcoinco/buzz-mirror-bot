@@ -627,6 +627,7 @@ RUN_CALLS.clear()
 # recovery. It also means tick()'s `github-unavailable` branch is unreachable
 # from the API - only git-over-https can raise into it.
 
+import http.client  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
@@ -672,6 +673,26 @@ urllib.request.urlopen = urlopen_502_then_ok
 check("a github api 5xx is retried until it clears",
       sync.api("/x", "tok") == {"ok": True})
 check("and it took all three attempts", len(API_ATTEMPTS) == 3)
+
+API_ATTEMPTS.clear()
+
+
+def urlopen_disconnect_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 2:
+        raise http.client.RemoteDisconnected(
+            "Remote end closed connection without response")
+    return FakeResp(b'{"ok": true}')
+
+
+# RemoteDisconnected subclasses ConnectionResetError, so api()'s `except OSError`
+# already caught it - but its message never says "reset", so TRANSIENT did not
+# match and it raised on the first attempt. That is a far side restarting
+# mid-request, which is the event this branch exists for.
+urllib.request.urlopen = urlopen_disconnect_then_ok
+check("a far side that hangs up mid-request is retried",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it cleared on the second attempt", len(API_ATTEMPTS) == 2)
 
 API_ATTEMPTS.clear()
 

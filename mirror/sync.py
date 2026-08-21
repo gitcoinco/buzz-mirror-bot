@@ -462,12 +462,18 @@ GIT_COMMON = [
 # 2026-08-21. If a fourth client ever reports here, assume its wording is a
 # fourth spelling until someone has run it.
 #
+# `closed connection without response` is http.client.RemoteDisconnected, which
+# subclasses ConnectionResetError and so is already caught in api() - but its
+# message never says "reset", so it raised on the first attempt. A relay or
+# GitHub restart mid-request is exactly the event this pattern exists for.
+# Found by judgebot, 2026-08-21; the string is measured, not quoted from docs.
+#
 # The relay half is belt-and-braces: buzz_read prefers the CLI's own
 # `retryable` field and only falls back to this pattern when there is no JSON
 # to read. See cli_retryable().
 TRANSIENT = re.compile(
     r"returned error: 5\d\d|HTTP Error 5\d\d|relay error 5\d\d"
-    r"|connection reset|timed out"
+    r"|connection reset|closed connection without response|timed out"
     r"|connection refused|failed to connect",
     re.IGNORECASE)
 
