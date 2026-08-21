@@ -767,6 +767,26 @@ check("and it sends the reader to ls-remote, not to `buzz repos get`",
       and any("not that a repo exists" in p for p in POSTS))
 
 
+def boom_gh_not_found(buzz_owner, repo_id, gh_repo, tok, st):
+    raise RuntimeError("git failed (128): remote: Repository not found.\nfatal: "
+                       "repository 'https://github.com/irlfund/regenOS.git/' not found")
+
+
+# GitHub words a missing App grant the same way the relay words its generic
+# denial, so the note has to be gated on the label rather than on the wording.
+# Reachable: the token is minted at discovery and used minutes later, so a repo
+# deleted, renamed, made private, or a grant revoked inside that window lands
+# here. Every step the note offers is about the relay, so on this halt all four
+# are wrong, and its first line is false outright.
+sync.reconcile = boom_gh_not_found
+POSTS.clear(); touched.clear()
+check("a GitHub 404 still halts", sync.main() == 1)
+check("and it is labelled as a GitHub auth failure",
+      any("github-auth-failed" in p for p in POSTS))
+check("and it does NOT carry the relay's ambiguity note",
+      not any("ambiguous by design" in p for p in POSTS))
+
+
 def boom_500(buzz_owner, repo_id, gh_repo, tok, st):
     raise RuntimeError("fatal: unable to access 'https://github.com/o/r.git/': "
                        "The requested URL returned error: 500")

@@ -885,7 +885,13 @@ def tick():
             else:
                 reason = "reconcile-failed"
             detail = f"```\n{msg[:800]}\n```"
-            if REPO_NOT_FOUND.search(msg):
+            # Gated on the reason, not on the wording alone. GitHub renders an
+            # installation that lacks access as `remote: Repository not found.`
+            # too, and the note's first line ("the label above says auth because
+            # the URL is a Buzz one") is false there - it would send the reader
+            # to a clone tag, a channel member list and the relay's event
+            # ordering for a missing App grant.
+            if reason.startswith("buzz-") and REPO_NOT_FOUND.search(msg):
                 detail += AMBIGUOUS_404
             halt(state, repo_id, reason, detail)
     if ok:
