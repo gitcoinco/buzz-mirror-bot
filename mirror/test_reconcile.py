@@ -35,6 +35,10 @@ import sync  # noqa: E402
 POSTS = []
 sync.post = lambda text: POSTS.append(text)
 sync.open_pr = lambda *a, **k: "buzz://pr/test"
+# The discovery tests below replace buzz_cli with a canned-JSON lambda. Keep the
+# real one: the retry tests need a buzz_cli that actually reaches run(), or they
+# would pass against the stub without exercising anything.
+REAL_BUZZ_CLI = sync.buzz_cli
 
 BUZZ = os.path.join(TMP, "buzz.git")
 GITHUB = os.path.join(TMP, "github.git")
@@ -483,6 +487,58 @@ check("a refused connection is retried until it clears",
       sync.git("/tmp", "fetch") == "ok")
 check("it took all three attempts", len(RUN_CALLS) == 3)
 
+RUN_CALLS.clear()
+
+# Discovery is the tick's first contact with the relay and it sits OUTSIDE
+# tick()'s per-repo try, so a relay refusing at tick start never reaches halt():
+# no state, no reason, no post, and no recovery message later either. The read
+# is idempotent, so it retries.
+sync.buzz_cli = REAL_BUZZ_CLI
+sync.run = refused_then_ok
+check("the retrying read wrapper works", sync.buzz_read("repos", "list") == "ok")
+check("and it took all three attempts", len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+
+
+def refused_then_repos(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError("Failed to connect to buzz.gitcoin.co port 443 after "
+                           "0 ms: Connection refused")
+    return json.dumps(BUZZ_REPOS_BY_OWNER.get(args[-1], []))
+
+
+# The wrapper is worth nothing unless discovery actually goes through it. This
+# is the wiring check: swapping buzz_read back to buzz_cli in discover_buzz()
+# fails here and nowhere else.
+sync.run = refused_then_repos
+bz_retry, bz_retry_ok = sync.discover_buzz()
+check("discovery itself survives a refusing relay",
+      bz_retry_ok and bz_retry["regenos-dev"] == (OWNER1, "irlfund/regenOS"))
+
+RUN_CALLS.clear()
+
+
+def refused_always(args, **kw):
+    RUN_CALLS.append(args)
+    raise RuntimeError("Failed to connect to buzz.gitcoin.co port 443 after "
+                       "0 ms: Connection refused")
+
+
+# The writes must NOT retry: `messages send` and `pr open` are not idempotent,
+# so a retry double-posts an alert or opens a second PR for the same sha.
+sync.run = refused_always
+try:
+    sync.buzz_cli("messages", "send", "--channel", "c", "--content", "x")
+    raised = False
+except RuntimeError:
+    raised = True
+check("a write is not retried", raised and len(RUN_CALLS) == 1)
+
+# Put the canned-JSON discovery stub back: everything below drives main(), which
+# reaches discover_buzz(), and the real buzz_cli would shell out to `buzz`.
+sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS_BY_OWNER.get(a[-1], []))
 sync.run = real_run
 
 

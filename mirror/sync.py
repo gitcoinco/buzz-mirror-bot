@@ -58,7 +58,8 @@ separately, which is why there is no allowlist here to narrow the set with.
 Every tick is self-contained - state lives in state.json and the bare clones on
 the volume, never in memory - so nothing needs a process to stay alive. The
 deployed shape is one container per run: a **systemd timer on infra-box** runs
-`docker run --rm <image> --once` every five minutes (`deploy/`). The run's own
+`docker run --rm <image> --once` every minute (it was five until 2026-08-09; the
+units live in the aei repo, not here). The run's own
 exit status is the alert, via the unit's `OnFailure=`.
 
 Two things follow from running there rather than as a Coolify application. The
@@ -304,7 +305,7 @@ def discover_buzz():
     """
     out, owner_of, ok = {}, {}, True
     for buzz_owner in BUZZ_OWNERS:
-        for ev in json.loads(buzz_cli("repos", "list", "--owner", buzz_owner)):
+        for ev in json.loads(buzz_read("repos", "list", "--owner", buzz_owner)):
             tags = {}
             for t in ev.get("tags", []):
                 if len(t) >= 2:
@@ -425,7 +426,10 @@ TRANSIENT = re.compile(
     r"|connection refused|failed to connect",
     re.IGNORECASE)
 
-GIT_TRIES = 3        # attempts per git operation within one tick
+# Named for git because that is where they started; they now also govern the
+# relay read in discover_buzz(). Kept as one pair on purpose: both are the same
+# question, "did the far side answer this tick".
+GIT_TRIES = 3        # attempts per network operation within one tick
 GIT_RETRY_DELAY = 5  # seconds between attempts
 
 
@@ -508,6 +512,36 @@ def is_ancestor(d, a, b):
 
 def buzz_cli(*args):
     return run(["buzz", *args])
+
+
+def buzz_read(*args):
+    """A READ-ONLY buzz call, retried like git on a transient relay failure.
+
+    Deliberately separate from buzz_cli rather than folded into it: the writes
+    that go through buzz_cli are `messages send` and `pr open`, and neither is
+    idempotent. Retrying those would double-post an alert or open a second PR
+    for the same sha, which is worse than the failure.
+
+    This exists because discovery is the tick's FIRST contact with the relay and
+    it sits outside tick()'s per-repo `try` (`discover()` is called at the top of
+    tick(), and main() catches what escapes). A relay that is already refusing
+    when the tick starts therefore never reaches halt(): no state entry, no
+    reason, no post - and because nothing was halted, the next good tick has no
+    halt to clear, so there is no recovery message either. The whole outage
+    leaves one `ERROR tick failed` line per tick and nothing structured.
+
+    A restart that clears inside GIT_TRIES * GIT_RETRY_DELAY now costs nothing
+    at all. A longer one still lands there; that shape is aei issue 9230a23d.
+    """
+    for attempt in range(1, GIT_TRIES + 1):
+        try:
+            return buzz_cli(*args)
+        except RuntimeError as e:
+            if attempt == GIT_TRIES or not TRANSIENT.search(str(e)):
+                raise
+            log(f"WARN transient relay failure (attempt {attempt}/{GIT_TRIES}), "
+                f"retrying in {GIT_RETRY_DELAY}s: {str(e)[:200]}")
+            time.sleep(GIT_RETRY_DELAY)
 
 
 def post(text):
