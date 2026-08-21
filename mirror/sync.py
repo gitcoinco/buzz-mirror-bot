@@ -558,6 +558,25 @@ AMBIGUOUS_404 = (
     "4. whether the relay was restarting at this timestamp"
 )
 
+# GitHub words a missing App grant the same way, so the note above is gated on
+# the label. Gating it left the GitHub reader with a bare traceback and no
+# guidance, and the guidance already existed - in a test comment, which is the
+# one place an operator at 3am will not look. Same four words, entirely
+# different answer. opsbot asked for this while reviewing.
+GITHUB_404 = (
+    "\n\nGitHub renders both a missing repo and a missing App grant as "
+    "`Repository not found.`, so this does not say which. The token is minted "
+    "during discovery and used minutes later, so the repo may have been "
+    "deleted, renamed or made private in that window, or the App's grant "
+    "revoked in it.\n\n"
+    "Check, in that order:\n"
+    "1. whether the repo still exists under that owner and name\n"
+    "2. whether the App's installation still lists it - a grant is per "
+    "repository, and a repo added to the org after the grant is not in it\n"
+    "3. whether the repo went private\n\n"
+    "None of the relay's checks apply here. The mirror's Buzz side is fine."
+)
+
 GIT_TRIES = 3        # attempts per network operation within one tick
 GIT_RETRY_DELAY = 5  # seconds between attempts
 
@@ -937,8 +956,11 @@ def tick():
             # the URL is a Buzz one") is false there - it would send the reader
             # to a clone tag, a channel member list and the relay's event
             # ordering for a missing App grant.
-            if reason.startswith("buzz-") and REPO_NOT_FOUND.search(msg):
-                detail += AMBIGUOUS_404
+            if REPO_NOT_FOUND.search(msg):
+                if reason.startswith("buzz-"):
+                    detail += AMBIGUOUS_404
+                elif reason.startswith("github-"):
+                    detail += GITHUB_404
             halt(state, repo_id, reason, detail)
     if ok:
         touch_last_success()
