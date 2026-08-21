@@ -35,6 +35,12 @@ import sync  # noqa: E402
 POSTS = []
 sync.post = lambda text: POSTS.append(text)
 sync.open_pr = lambda *a, **k: "buzz://pr/test"
+# The discovery tests below replace buzz_cli and api with stubs, for the rest of
+# the file. Keep the real ones: the retry tests need implementations that
+# actually reach run()/urlopen, or they pass against a stub having exercised
+# nothing. This bit me once already.
+REAL_BUZZ_CLI = sync.buzz_cli
+REAL_API = sync.api
 
 BUZZ = os.path.join(TMP, "buzz.git")
 GITHUB = os.path.join(TMP, "github.git")
@@ -463,6 +469,339 @@ except RuntimeError:
 check("a persistent 5xx still raises after the last attempt",
       raised and len(RUN_CALLS) == sync.GIT_TRIES)
 
+RUN_CALLS.clear()
+
+
+def refused_then_ok(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError(
+            "git failed (128): fatal: unable to access "
+            "'https://buzz.gitcoin.co/git/o/r.git/': Failed to connect to "
+            "buzz.gitcoin.co port 443 after 0 ms: Connection refused")
+    return "ok"
+
+
+# A host restarting refuses connections. It was not retried until 2026-08-21,
+# so a relay restart halted the mirror on the first failed operation.
+sync.run = refused_then_ok
+check("a refused connection is retried until it clears",
+      sync.git("/tmp", "fetch") == "ok")
+check("it took all three attempts", len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+
+# Discovery is the tick's first contact with the relay and it sits OUTSIDE
+# tick()'s per-repo try, so a relay refusing at tick start never reaches halt():
+# no state, no reason, no post, and no recovery message later either. The read
+# is idempotent, so it retries.
+sync.buzz_cli = REAL_BUZZ_CLI
+sync.run = refused_then_ok
+check("the retrying read wrapper works", sync.buzz_read("repos", "list") == "ok")
+check("and it took all three attempts", len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+
+
+def refused_then_repos(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError("Failed to connect to buzz.gitcoin.co port 443 after "
+                           "0 ms: Connection refused")
+    return json.dumps(BUZZ_REPOS_BY_OWNER.get(args[-1], []))
+
+
+# The wrapper is worth nothing unless discovery actually goes through it. This
+# is the wiring check: swapping buzz_read back to buzz_cli in discover_buzz()
+# fails here and nowhere else.
+sync.run = refused_then_repos
+bz_retry, bz_retry_ok = sync.discover_buzz()
+check("discovery itself survives a refusing relay",
+      bz_retry_ok and bz_retry["regenos-dev"] == (OWNER1, "irlfund/regenOS"))
+
+RUN_CALLS.clear()
+
+
+def refused_always(args, **kw):
+    RUN_CALLS.append(args)
+    raise RuntimeError("Failed to connect to buzz.gitcoin.co port 443 after "
+                       "0 ms: Connection refused")
+
+
+# The writes must NOT retry: `messages send` and `pr open` are not idempotent,
+# so a retry double-posts an alert or opens a second PR for the same sha.
+sync.run = refused_always
+try:
+    sync.buzz_cli("messages", "send", "--channel", "c", "--content", "x")
+    raised = False
+except RuntimeError:
+    raised = True
+check("a write is not retried", raised and len(RUN_CALLS) == 1)
+
+RUN_CALLS.clear()
+
+# --- the CLI's own retryable flag -------------------------------------------
+# A 5xx has three renderings and the pattern only ever knew two at a time. The
+# CLI states its verdict, so for this one caller we read it instead of guessing
+# at prose. run() attaches stderr, and the CLI prints its JSON there.
+CLI_503 = ('buzz failed (2): {"error":"relay_error","message":"relay error 503: ",'
+           '"retryable":true}')
+CLI_404 = ('buzz failed (2): {"error":"relay_error","message":"relay error 404: '
+           '404 page not found","retryable":false}')
+
+check("the CLI's retryable flag is read", sync.cli_retryable(RuntimeError(CLI_503)) is True)
+check("and its refusal is read too", sync.cli_retryable(RuntimeError(CLI_404)) is False)
+check("no JSON means no verdict, so TRANSIENT decides",
+      sync.cli_retryable(RuntimeError("buzz failed (101): panicked at 'x'")) is None)
+
+
+def cli_503_then_ok(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError(CLI_503)
+    return "ok"
+
+
+def cli_404_always(args, **kw):
+    RUN_CALLS.append(args)
+    raise RuntimeError(CLI_404)
+
+
+sync.buzz_cli = REAL_BUZZ_CLI
+sync.run = cli_503_then_ok
+check("a relay 5xx is retried on the CLI's word",
+      sync.buzz_read("repos", "list") == "ok" and len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+
+# The case where the CLI and the pattern DISAGREE, which is the only thing that
+# proves buzz_read prefers the verdict. DNS: the CLI calls it retryable, the
+# pattern does not match it, and the git side deliberately does not retry it.
+# Deferring to the CLI here is a decision, not an oversight - see cli_retryable.
+CLI_DNS = ('buzz failed (2): {"error":"network_error","message":"network error: '
+           'dns error: failed to lookup address information","retryable":true}')
+
+
+def cli_dns_then_ok(args, **kw):
+    RUN_CALLS.append(args)
+    if len(RUN_CALLS) < 3:
+        raise RuntimeError(CLI_DNS)
+    return "ok"
+
+
+check("the pattern alone would not retry DNS",
+      not sync.TRANSIENT.search(CLI_DNS))
+sync.run = cli_dns_then_ok
+check("but the CLI's verdict wins, so it is retried",
+      sync.buzz_read("repos", "list") == "ok" and len(RUN_CALLS) == 3)
+
+RUN_CALLS.clear()
+sync.run = cli_404_always
+try:
+    sync.buzz_read("repos", "list")
+    raised = False
+except RuntimeError:
+    raised = True
+check("a relay 404 is not retried, also on the CLI's word",
+      raised and len(RUN_CALLS) == 1)
+
+# The regex is the fallback for when there is no JSON, so it needs the third
+# spelling too. reqwest says `relay error 503`; curl and urllib say neither.
+check("the third 5xx spelling is in the pattern",
+      bool(sync.TRANSIENT.search("relay error 503: ")))
+
+# `repository not found` is the relay's generic denial and a proxy with no
+# backend renders the same way. The halt cannot resolve that, so it must say so.
+check("an ambiguous 404 is flagged as ambiguous",
+      bool(sync.REPO_NOT_FOUND.search(
+          "git failed (128): remote: repository not found")))
+check("an unrelated failure is not",
+      not sync.REPO_NOT_FOUND.search("git failed (128): remote: requires Owner role"))
+
+RUN_CALLS.clear()
+
+# --- the GitHub half of discovery ------------------------------------------
+# api() is called only from paginate() and the token mint, both inside
+# discovery and neither inside reconcile(). So an API failure took the same
+# path a refusing relay used to: out of tick(), no halt(), no post, no later
+# recovery. It also means tick()'s `github-unavailable` branch is unreachable
+# from the API - only git-over-https can raise into it.
+
+import http.client  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+
+# urllib does not phrase a 5xx the way curl does, so the git-shaped half of
+# TRANSIENT never matched here. This is the assertion that keeps both spellings.
+check("urllib's 5xx wording is transient",
+      bool(sync.TRANSIENT.search(str(
+          urllib.error.HTTPError("u", 502, "Bad Gateway", {}, None)))))
+check("curl's 5xx wording still is",
+      bool(sync.TRANSIENT.search(
+          "The requested URL returned error: 502")))
+check("a 404 is not transient",
+      not sync.TRANSIENT.search(str(
+          urllib.error.HTTPError("u", 404, "Not Found", {}, None))))
+
+sync.api = REAL_API
+REAL_URLOPEN = urllib.request.urlopen
+API_ATTEMPTS = []
+
+
+class FakeResp:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def urlopen_502_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 3:
+        raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, None)
+    return FakeResp(b'{"ok": true}')
+
+
+urllib.request.urlopen = urlopen_502_then_ok
+check("a github api 5xx is retried until it clears",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it took all three attempts", len(API_ATTEMPTS) == 3)
+
+API_ATTEMPTS.clear()
+
+
+def urlopen_disconnect_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 2:
+        raise http.client.RemoteDisconnected(
+            "Remote end closed connection without response")
+    return FakeResp(b'{"ok": true}')
+
+
+# RemoteDisconnected subclasses ConnectionResetError, so api()'s `except OSError`
+# already caught it - but its message never says "reset", so TRANSIENT did not
+# match and it raised on the first attempt. That is a far side restarting
+# mid-request, which is the event this branch exists for.
+urllib.request.urlopen = urlopen_disconnect_then_ok
+check("a far side that hangs up mid-request is retried",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it cleared on the second attempt", len(API_ATTEMPTS) == 2)
+
+API_ATTEMPTS.clear()
+
+
+def urlopen_truncated_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 2:
+        raise http.client.IncompleteRead(b"short", 495)
+    return FakeResp(b'{"ok": true}')
+
+
+# The one that no pattern could have fixed. IncompleteRead subclasses
+# HTTPException, not OSError, so before this it escaped api()'s handler
+# entirely: out of tick(), exit 1, no halt and no post. Mutating the except
+# clause back to `except OSError` fails this check by raising, not by looping.
+urllib.request.urlopen = urlopen_truncated_then_ok
+check("a truncated github response body is caught and retried",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it cleared on the second attempt", len(API_ATTEMPTS) == 2)
+check("urllib's truncation wording is transient",
+      bool(sync.TRANSIENT.search(str(http.client.IncompleteRead(b"short", 495)))))
+
+API_ATTEMPTS.clear()
+
+
+def urlopen_bad_status_then_ok(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    if len(API_ATTEMPTS) < 2:
+        # Synthetic wording, and labelled as such: no BadStatusLine observed in
+        # the wild words itself transiently, so the message is chosen to make
+        # the two catch clauses disagree. What is being tested is the clause,
+        # not the wording - the wordings are measured further down.
+        raise http.client.BadStatusLine("relay error 503")
+    return FakeResp(b'{"ok": true}')
+
+
+# IncompleteRead was one member of a family. BadStatusLine, LineTooLong,
+# InvalidURL and UnknownProtocol are HTTPException and not OSError too, so
+# naming IncompleteRead alone left them escaping api() exactly as it did.
+# BadStatusLine is what a proxy with no backend raises, which is producer four
+# in AMBIGUOUS_404. Mutating the clause back to `except (OSError,
+# http.client.IncompleteRead)` fails this by raising, not by looping.
+urllib.request.urlopen = urlopen_bad_status_then_ok
+check("a garbage status line is caught by the family, not by one subclass",
+      sync.api("/x", "tok") == {"ok": True})
+check("and it cleared on the second attempt", len(API_ATTEMPTS) == 2)
+API_ATTEMPTS.clear()
+
+
+def urlopen_bad_status_forever(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    raise http.client.BadStatusLine("<html>hello</html>")
+
+
+# The other half of the clause: catching wider is not retrying wider. A member
+# whose wording is not transient still leaves on the first attempt, which is
+# where it left this function before the clause was widened.
+urllib.request.urlopen = urlopen_bad_status_forever
+try:
+    sync.api("/x", "tok")
+    raised = False
+except http.client.BadStatusLine:
+    raised = True
+check("a non-transient HTTPException still leaves on the first attempt",
+      raised and len(API_ATTEMPTS) == 1)
+
+API_ATTEMPTS.clear()
+
+# git and urllib word the same two events differently, and git is the client
+# that does all the mirror's real traffic. Both measured against a stub server
+# on 2026-08-21 rather than quoted: a far side that accepts and hangs up, and
+# one that answers and truncates.
+check("git's wording for a hangup mid-request is transient",
+      bool(sync.TRANSIENT.search(
+          "fatal: unable to access 'https://buzz.gitcoin.co/git/o/r.git/': "
+          "Empty reply from server")))
+check("git's wording for a truncated body is transient",
+      bool(sync.TRANSIENT.search(
+          "fatal: unable to access 'https://github.com/o/r.git/': "
+          "end of response with 495 bytes missing")))
+# The one deliberately left out: a mid-stream push failure and a server-side
+# hook rejection render identically, so retrying it would triple a real
+# rejection.
+check("a hung-up remote end is NOT transient",
+      not sync.TRANSIENT.search(
+          "fatal: the remote end hung up unexpectedly"))
+
+
+def urlopen_404(req, timeout=None):
+    API_ATTEMPTS.append(req.full_url)
+    raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+
+# A 404 cannot clear on a second attempt, so it must halt immediately rather
+# than spend GIT_TRIES * GIT_RETRY_DELAY seconds first.
+urllib.request.urlopen = urlopen_404
+try:
+    sync.api("/x", "tok")
+    raised = False
+except urllib.error.HTTPError:
+    raised = True
+check("a github api 404 is not retried", raised and len(API_ATTEMPTS) == 1)
+
+urllib.request.urlopen = REAL_URLOPEN
+sync.api = fake_api
+
+# Put the canned-JSON discovery stub back: everything below drives main(), which
+# reaches discover_buzz(), and the real buzz_cli would shell out to `buzz`.
+sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS_BY_OWNER.get(a[-1], []))
 sync.run = real_run
 
 
@@ -491,6 +830,72 @@ POSTS.clear(); touched.clear()
 check("failed run exits non-zero", sync.main() == 1)
 check("failed run did NOT record success", touched == [])
 check("failure is attributed to github", any("github-auth-failed" in p for p in POSTS))
+
+
+def boom_refused(buzz_owner, repo_id, gh_repo, tok, st):
+    raise RuntimeError("git failed (128): fatal: unable to access "
+                       "'https://buzz.gitcoin.co/git/o/r.git/': Failed to "
+                       "connect to buzz.gitcoin.co port 443 after 0 ms: "
+                       "Connection refused")
+
+
+# The relay restarting must not be reported as a revoked key. Before
+# 2026-08-21 it was: connection-refused missed TRANSIENT, so `tick()` fell to
+# the else arm and posted `buzz-auth-failed`. The halt is correct; the label
+# is what a human reads at 3am, and these two want opposite responses.
+sync.reconcile = boom_refused
+POSTS.clear(); touched.clear()
+check("a refused relay still fails the run", sync.main() == 1)
+check("a relay restart is unavailable, not an auth failure",
+      any("buzz-unavailable" in p for p in POSTS)
+      and not any("auth-failed" in p for p in POSTS))
+
+
+def boom_not_found(buzz_owner, repo_id, gh_repo, tok, st):
+    raise RuntimeError("git failed (128): remote: repository not found\nfatal: "
+                       "repository 'https://buzz.gitcoin.co/git/o/r.git/' not found")
+
+
+# The wiring check for the ambiguity note: `repository not found` is the relay's
+# generic denial, a stale coordinate and a proxy with no backend render the
+# same, and none of the three carries a status code. tick() still has to label
+# it `buzz-auth-failed` because the URL is a Buzz one, so the halt has to say
+# that the label named one of three possibilities rather than a checked fact.
+sync.reconcile = boom_not_found
+POSTS.clear(); touched.clear()
+check("an ambiguous 404 still halts", sync.main() == 1)
+check("and the halt says the auth label was not a checked fact",
+      any("ambiguous by design" in p for p in POSTS)
+      and any("buzz channels members" in p for p in POSTS))
+check("and it sends the reader to ls-remote, not to `buzz repos get`",
+      any("git ls-remote" in p for p in POSTS)
+      and any("not that a repo exists" in p for p in POSTS))
+check("and it does NOT carry the GitHub note",
+      not any("whether the installation covers it" in p for p in POSTS))
+
+
+def boom_gh_not_found(buzz_owner, repo_id, gh_repo, tok, st):
+    raise RuntimeError("git failed (128): remote: Repository not found.\nfatal: "
+                       "repository 'https://github.com/irlfund/regenOS.git/' not found")
+
+
+# GitHub words a missing App grant the same way the relay words its generic
+# denial, so the note has to be gated on the label rather than on the wording.
+# Reachable: the token is minted at discovery and used minutes later, so a repo
+# deleted, renamed, made private, or a grant revoked inside that window lands
+# here. Every step the note offers is about the relay, so on this halt all four
+# are wrong, and its first line is false outright.
+sync.reconcile = boom_gh_not_found
+POSTS.clear(); touched.clear()
+check("a GitHub 404 still halts", sync.main() == 1)
+check("and it is labelled as a GitHub auth failure",
+      any("github-auth-failed" in p for p in POSTS))
+check("and it does NOT carry the relay's ambiguity note",
+      not any("ambiguous by design" in p for p in POSTS))
+check("and it carries the GitHub one instead",
+      any("whether the installation covers it" in p for p in POSTS))
+check("which does not send the reader to the relay",
+      not any("buzz channels members" in p for p in POSTS))
 
 
 def boom_500(buzz_owner, repo_id, gh_repo, tok, st):

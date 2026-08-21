@@ -58,7 +58,8 @@ separately, which is why there is no allowlist here to narrow the set with.
 Every tick is self-contained - state lives in state.json and the bare clones on
 the volume, never in memory - so nothing needs a process to stay alive. The
 deployed shape is one container per run: a **systemd timer on infra-box** runs
-`docker run --rm <image> --once` every five minutes (`deploy/`). The run's own
+`docker run --rm <image> --once` every minute (it was five until 2026-08-09; the
+units live in the aei repo, not here). The run's own
 exit status is the alert, via the unit's `OnFailure=`.
 
 Two things follow from running there rather than as a Coolify application. The
@@ -87,6 +88,7 @@ pure latency optimisation without touching it.
 """
 
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -204,6 +206,50 @@ def app_jwt():
 
 
 def api(path, token, method="GET", scheme="Bearer"):
+    """A GitHub API call, retried on a transient failure like git() and
+    buzz_read().
+
+    Both call sites are in discovery - the installation listing in paginate()
+    and the token mint below - and neither is in reconcile(). So a GitHub 5xx
+    here takes the same path a refusing relay used to: straight out of tick(),
+    `ERROR tick failed`, exit 1, no halt() and therefore no post and no later
+    recovery message. It also means the `github-unavailable` branch in tick()
+    is unreachable from the API; only git-over-https can raise into it.
+
+    The token mint is a POST, and it is retried anyway: it creates a fresh
+    short-lived installation token, so a duplicate is an unused token that
+    expires in an hour, not a duplicated side effect. That is the reason
+    buzz_read exists for the relay's reads but its writes are left alone -
+    `messages send` and `pr open` are not harmless to repeat.
+
+    urllib.error.HTTPError and URLError both subclass OSError; a malformed body
+    raises ValueError and is not retried, which is right - it will not clear.
+
+    http.client.HTTPException is the exception to that tidy story. It does NOT
+    subclass OSError, so every member of that family escaped this handler
+    entirely - out of tick(), `ERROR tick failed`, exit 1, no halt, no post. A
+    truncated response body (IncompleteRead) is the one that started this, but
+    naming it alone left BadStatusLine, LineTooLong, InvalidURL and
+    UnknownProtocol still escaping. Any of them is the same event as the one
+    that started this: api.github.com answered badly or not at all. The family
+    is caught, not one member of it, because no pattern can help an exception
+    that is never caught.
+
+    An earlier version of this paragraph cited Coolify's proxy with no backend
+    as the BadStatusLine case. That example is wrong twice, and opsbot caught
+    both: the proxy is producer THREE in AMBIGUOUS_404, not four, and it cannot
+    reach this function at all. The one urlopen below goes to GITHUB_API; the
+    relay is reached through the buzz CLI as a subprocess and through git, so a
+    proxy answering with garbage arrives as a RuntimeError out of run(), never
+    as an HTTPException. Justifying a handler with a failure from the other
+    side of the system is the mirror of the bug this branch keeps finding.
+
+    Catching wider does not retry wider: TRANSIENT still decides, so a member
+    whose wording is not transient re-raises on the first attempt, which is
+    where it left this function before. Retrying the ones that do match is safe
+    on the same grounds as everything else here: the listing is a GET and the
+    mint is idempotent in effect.
+    """
     req = urllib.request.Request(
         f"{GITHUB_API}{path}",
         method=method,
@@ -213,8 +259,16 @@ def api(path, token, method="GET", scheme="Bearer"):
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    for attempt in range(1, GIT_TRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except (OSError, http.client.HTTPException) as e:
+            if attempt == GIT_TRIES or not TRANSIENT.search(str(e)):
+                raise
+            log(f"WARN transient github api failure (attempt {attempt}/"
+                f"{GIT_TRIES}), retrying in {GIT_RETRY_DELAY}s: {str(e)[:200]}")
+            time.sleep(GIT_RETRY_DELAY)
 
 
 def paginate(path, token, key=None):
@@ -304,7 +358,7 @@ def discover_buzz():
     """
     out, owner_of, ok = {}, {}, True
     for buzz_owner in BUZZ_OWNERS:
-        for ev in json.loads(buzz_cli("repos", "list", "--owner", buzz_owner)):
+        for ev in json.loads(buzz_read("repos", "list", "--owner", buzz_owner)):
             tags = {}
             for t in ev.get("tags", []):
                 if len(t) >= 2:
@@ -405,13 +459,143 @@ GIT_COMMON = [
 
 
 # Failure classes worth a second attempt within the tick: a 5xx from either
-# git host, a reset connection, a timeout. Auth denials and non-fast-forward
-# rejections are deliberately absent - retrying those cannot succeed and would
-# only delay the halt.
-TRANSIENT = re.compile(r"returned error: 5\d\d|connection reset|timed out",
-                       re.IGNORECASE)
+# git host, a reset connection, a timeout, a refused or unreachable host. Auth
+# denials and non-fast-forward rejections are deliberately absent - retrying
+# those cannot succeed and would only delay the halt.
+#
+# A host that is restarting refuses connections, and until 2026-08-21 that was
+# neither retried nor labelled honestly: `tick()` reads this pattern to choose
+# between `*-unavailable` and `*-auth-failed`, so a relay restart was reported
+# as `buzz-auth-failed` - the label for a revoked key, which is the one thing
+# the branch there exists to keep apart from an outage. Both halves are fixed
+# by matching it here.
+#
+# `failed to connect` also covers unreachable and no-route. It can match a
+# permanently wrong host or port too; the cost of that is one halt delayed by
+# GIT_TRIES * GIT_RETRY_DELAY seconds, which is cheaper than mislabelling an
+# outage as an auth failure.
+#
+# THREE spellings of the same 5xx, because three clients report it and each
+# words it differently:
+#
+#   returned error: 503   curl, via git
+#   HTTP Error 503        urllib, via api()
+#   relay error 503       reqwest, via the buzz CLI
+#
+# Matching only curl's is how this pattern silently did nothing on the GitHub
+# API side. Adding urllib's and stopping there is how it would silently have
+# done nothing on the relay side. Measured by opsbot against a live relay,
+# 2026-08-21. If a fourth client ever reports here, assume its wording is a
+# fourth spelling until someone has run it.
+#
+# `closed connection without response` is http.client.RemoteDisconnected, which
+# subclasses ConnectionResetError and so is already caught in api() - but its
+# message never says "reset", so it raised on the first attempt. A relay or
+# GitHub restart mid-request is exactly the event this pattern exists for.
+# Found by judgebot, 2026-08-21; the string is measured, not quoted from docs.
+#
+# Five review rounds added one spelling each, so the sixth and seventh came
+# from running the ENUMERATION instead: drive every client this pattern reads
+# for against the same two events, and write down what each one says. Stub
+# server, measured 2026-08-21, `curl 7.88` / `git 2.47` / `python 3.13`:
+#
+#   far side accepts the request and hangs up without answering
+#     git     unable to access '...': Empty reply from server
+#     urllib  Remote end closed connection without response
+#     CLI     Connection reset by peer (os error 104), retryable:true
+#
+#   far side answers, then truncates the body
+#     git     end of response with 495 bytes missing
+#     urllib  IncompleteRead(5 bytes read, 495 more expected)
+#
+# Note which half was uncovered: git, the client that does all the mirror's
+# real traffic, on the event judgebot found on the urllib side. `Empty reply
+# from server` carries no status code and does not say "reset", so with
+# buzz.gitcoin.co in the URL it landed on `buzz-auth-failed` - the 13:34
+# mislabel again, arriving by the busiest path. Found by opsbot, 2026-08-21.
+#
+# The truncation pair is worse than a missing spelling: IncompleteRead
+# subclasses http.client.HTTPException, NOT OSError, so api() did not catch it
+# at all and no pattern could have helped. Fixed there; see api().
+#
+# NOT in, and deliberately: `the remote end hung up unexpectedly`. A push that
+# dies mid-stream renders that way, but so does a server-side hook that
+# rejects, and retrying that triples a real rejection. Nobody has reproduced it
+# cleanly against a stub, so it stays out until someone has.
+#
+# The relay half is belt-and-braces: buzz_read prefers the CLI's own
+# `retryable` field and only falls back to this pattern when there is no JSON
+# to read. See cli_retryable().
+TRANSIENT = re.compile(
+    r"returned error: 5\d\d|HTTP Error 5\d\d|relay error 5\d\d"
+    r"|connection reset|closed connection without response|timed out"
+    r"|connection refused|failed to connect"
+    r"|empty reply from server|end of response with \d+ bytes missing"
+    r"|incompleteread",
+    re.IGNORECASE)
 
-GIT_TRIES = 3        # attempts per git operation within one tick
+# Named for git because that is where they started; they now also govern the
+# relay read in discover_buzz(). Kept as one pair on purpose: both are the same
+# question, "did the far side answer this tick".
+# `repository not found` is the relay's GENERIC DENIAL: a coordinate that does
+# not resolve, and a caller who is not a member of the repo's bound channel,
+# are deliberately rendered identically. Coolify's proxy with no backend is a
+# third producer, and an announcement whose repo was never created is a fourth.
+# None of the four carries a status code, and because the URL contains
+# buzz.gitcoin.co, tick() lands all of them on `buzz-auth-failed`, which names
+# one.
+#
+# The fourth is the one that defeats a naive check, and it is why step 1 below
+# is ls-remote rather than `buzz repos get`. ingest_event() inserts the event
+# BEFORE running its side effects and only logs a side-effect failure
+# (handlers/ingest.rs, "the event was accepted but its side effects ... did not
+# run"). So a kind:30617 whose handler errored - name taken by another owner,
+# per-pubkey repo limit, manifest pointer failure - is stored, listed, and
+# returns a matching `clone` tag for a repo that does not exist. Announcement
+# resolution is not liveness. `git ls-remote` is the only thing that is.
+#
+# The ambiguity is not fixable from this side, so the halt says so instead. Two
+# agents spent an hour on it from opposite ends on 2026-08-21, each confidently
+# naming a different one. opsbot found the fourth while reviewing this.
+REPO_NOT_FOUND = re.compile(r"repository .*not found", re.IGNORECASE)
+AMBIGUOUS_404 = (
+    "\n\n`repository not found` is ambiguous by design. It means one of: the "
+    "repo id or owner has changed and this remote is stale; this key is not a "
+    "member of the repo's bound channel; the announcement exists but the repo "
+    "behind it never did; or the relay is up and its proxy has no backend. The "
+    "label above says auth because the URL is a Buzz one, not because the key "
+    "was checked.\n\n"
+    "In that order of cost to check:\n"
+    "1. `git ls-remote <clone tag>` - NOT `buzz repos get`. A stored "
+    "announcement proves an event was accepted, not that a repo exists: the "
+    "relay inserts the event before its side effects and only logs a failure, "
+    "so a matching `clone` tag can front nothing at all.\n"
+    "2. compare that `clone` tag to the remote actually configured here\n"
+    "3. `buzz channels members --channel <the announcement's buzz-channel>`\n"
+    "4. whether the relay was restarting at this timestamp"
+)
+
+# GitHub words a missing App grant the same way, so the note above is gated on
+# the label. Gating it left the GitHub reader with a bare traceback and no
+# guidance, and the guidance already existed - in a test comment, which is the
+# one place an operator at 3am will not look. Same four words, entirely
+# different answer. opsbot asked for this while reviewing.
+GITHUB_404 = (
+    "\n\nGitHub renders both a missing repo and a missing App grant as "
+    "`Repository not found.`, so this does not say which. The token is minted "
+    "during discovery and used minutes later, so the repo may have been "
+    "deleted, renamed or made private in that window, or the App's grant "
+    "revoked in it.\n\n"
+    "Check, in that order:\n"
+    "1. whether the repo still exists under that owner and name\n"
+    "2. whether the installation covers it - if it is set to selected "
+    "repositories, one added since the grant is not in it; if it is set to all "
+    "repositories, new ones are picked up and this is not your cause\n"
+    "3. whether the repo went private\n\n"
+    "None of the relay's checks apply here. The mirror's Buzz side is fine."
+)
+
+GIT_TRIES = 3        # attempts per network operation within one tick
 GIT_RETRY_DELAY = 5  # seconds between attempts
 
 
@@ -494,6 +678,79 @@ def is_ancestor(d, a, b):
 
 def buzz_cli(*args):
     return run(["buzz", *args])
+
+
+def cli_retryable(err):
+    """The buzz CLI's own verdict on its failure, or None if it did not give one.
+
+    The CLI prints a structured error to stderr and run() attaches stderr, so
+    the JSON is inside the RuntimeError text:
+
+        {"error":"relay_error","message":"relay error 503: ","retryable":true}
+
+    Preferred over TRANSIENT for this one caller because it is a stated contract
+    rather than a guess at prose. The prose guess is genuinely fragile here: a
+    5xx has three renderings depending on which client saw it - `returned error:
+    503` from curl through git, `HTTP Error 503` from urllib in api(), and
+    `relay error 503` from reqwest in the CLI. Two of those were in the pattern
+    and the third was not, which is the hole opsbot measured on 2026-08-21.
+
+    Deferring to `retryable` wholesale, including for DNS, which the CLI reports
+    as retryable and the git side does not retry. The two paths disagree on
+    purpose: on the git side there is no verdict to read and prose is all there
+    is, so `could not resolve host` is excluded to keep a permanently wrong host
+    from costing GIT_TRIES * GIT_RETRY_DELAY on every tick. Here the CLI has
+    already answered, and a carve-out would mean overriding its contract to
+    save ten seconds on a misconfiguration. If that turns out to be wrong, the
+    carve-out belongs here as one explicit branch, not as a change of policy.
+
+    Returns None when there is no JSON to read - a panic, a truncated stream -
+    and the caller falls back to TRANSIENT.
+    """
+    text = str(err)
+    lo, hi = text.find("{"), text.rfind("}")
+    if lo == -1 or hi < lo:
+        return None
+    try:
+        return json.loads(text[lo:hi + 1]).get("retryable")
+    except (ValueError, AttributeError):
+        return None
+
+
+def buzz_read(*args):
+    """A READ-ONLY buzz call, retried like git on a transient relay failure.
+
+    Deliberately separate from buzz_cli rather than folded into it: the writes
+    that go through buzz_cli are `messages send` and `pr open`, and neither is
+    idempotent. Retrying those would double-post an alert or open a second PR
+    for the same sha, which is worse than the failure.
+
+    This exists because discovery is the tick's FIRST contact with the relay and
+    it sits outside tick()'s per-repo `try` (`discover()` is called at the top of
+    tick(), and main() catches what escapes). A relay that is already refusing
+    when the tick starts therefore never reaches halt(): no state entry, no
+    reason, no post - and because nothing was halted, the next good tick has no
+    halt to clear, so there is no recovery message either. The whole outage
+    leaves one `ERROR tick failed` line per tick and nothing structured.
+
+    A restart that clears inside GIT_TRIES * GIT_RETRY_DELAY now costs nothing
+    at all. A longer one still lands there; that shape is aei issue 9230a23d.
+
+    Retries on the CLI's own `retryable` flag where it gives one, falling back
+    to TRANSIENT where it does not - see cli_retryable().
+    """
+    for attempt in range(1, GIT_TRIES + 1):
+        try:
+            return buzz_cli(*args)
+        except RuntimeError as e:
+            verdict = cli_retryable(e)
+            if verdict is None:
+                verdict = bool(TRANSIENT.search(str(e)))
+            if attempt == GIT_TRIES or not verdict:
+                raise
+            log(f"WARN transient relay failure (attempt {attempt}/{GIT_TRIES}), "
+                f"retrying in {GIT_RETRY_DELAY}s: {str(e)[:200]}")
+            time.sleep(GIT_RETRY_DELAY)
 
 
 def post(text):
@@ -695,14 +952,34 @@ def tick():
             # reason, so a real auth failure arriving while a 5xx halt is live
             # must post as its own message, not be swallowed by it.
             msg = str(e)
-            transient = bool(TRANSIENT.search(msg))
+            # cli_retryable returns None on every path that reaches here today:
+            # the only buzz_cli callers left are post() and open_pr(), and both
+            # swallow their own exceptions, so a buzz-CLI error never surfaces
+            # in this handler. Kept because that is a property of the current
+            # call graph rather than a rule, and the day a CLI error does reach
+            # here the flag is the better answer. Untested on purpose - there is
+            # no way to exercise it without inventing a caller.
+            verdict = cli_retryable(e)
+            transient = bool(TRANSIENT.search(msg)) if verdict is None else verdict
             if "buzz.gitcoin.co" in msg or "not a relay member" in msg:
                 reason = "buzz-unavailable" if transient else "buzz-auth-failed"
             elif "github.com" in msg or "api.github.com" in msg:
                 reason = "github-unavailable" if transient else "github-auth-failed"
             else:
                 reason = "reconcile-failed"
-            halt(state, repo_id, reason, f"```\n{msg[:800]}\n```")
+            detail = f"```\n{msg[:800]}\n```"
+            # Gated on the reason, not on the wording alone. GitHub renders an
+            # installation that lacks access as `remote: Repository not found.`
+            # too, and the note's first line ("the label above says auth because
+            # the URL is a Buzz one") is false there - it would send the reader
+            # to a clone tag, a channel member list and the relay's event
+            # ordering for a missing App grant.
+            if REPO_NOT_FOUND.search(msg):
+                if reason.startswith("buzz-"):
+                    detail += AMBIGUOUS_404
+                elif reason.startswith("github-"):
+                    detail += GITHUB_404
+            halt(state, repo_id, reason, detail)
     if ok:
         touch_last_success()
     return ok
