@@ -762,6 +762,9 @@ check("an ambiguous 404 still halts", sync.main() == 1)
 check("and the halt says the auth label was not a checked fact",
       any("ambiguous by design" in p for p in POSTS)
       and any("buzz channels members" in p for p in POSTS))
+check("and it sends the reader to ls-remote, not to `buzz repos get`",
+      any("git ls-remote" in p for p in POSTS)
+      and any("not that a repo exists" in p for p in POSTS))
 
 
 def boom_500(buzz_owner, repo_id, gh_repo, tok, st):

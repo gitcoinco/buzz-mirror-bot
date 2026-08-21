@@ -476,26 +476,40 @@ TRANSIENT = re.compile(
 # question, "did the far side answer this tick".
 # `repository not found` is the relay's GENERIC DENIAL: a coordinate that does
 # not resolve, and a caller who is not a member of the repo's bound channel,
-# are deliberately rendered identically. Coolify's proxy with no backend behind
-# it is a third thing that can produce it, and none of the three carries a
-# status code. Because the URL contains buzz.gitcoin.co, tick() lands all of
-# them on `buzz-auth-failed`, which names only one.
+# are deliberately rendered identically. Coolify's proxy with no backend is a
+# third producer, and an announcement whose repo was never created is a fourth.
+# None of the four carries a status code, and because the URL contains
+# buzz.gitcoin.co, tick() lands all of them on `buzz-auth-failed`, which names
+# one.
+#
+# The fourth is the one that defeats a naive check, and it is why step 1 below
+# is ls-remote rather than `buzz repos get`. ingest_event() inserts the event
+# BEFORE running its side effects and only logs a side-effect failure
+# (handlers/ingest.rs, "the event was accepted but its side effects ... did not
+# run"). So a kind:30617 whose handler errored - name taken by another owner,
+# per-pubkey repo limit, manifest pointer failure - is stored, listed, and
+# returns a matching `clone` tag for a repo that does not exist. Announcement
+# resolution is not liveness. `git ls-remote` is the only thing that is.
 #
 # The ambiguity is not fixable from this side, so the halt says so instead. Two
 # agents spent an hour on it from opposite ends on 2026-08-21, each confidently
-# naming a different one of the three.
-REPO_NOT_FOUND = re.compile(r"repository .*not found|repository not found",
-                            re.IGNORECASE)
+# naming a different one. opsbot found the fourth while reviewing this.
+REPO_NOT_FOUND = re.compile(r"repository .*not found", re.IGNORECASE)
 AMBIGUOUS_404 = (
     "\n\n`repository not found` is ambiguous by design. It means one of: the "
     "repo id or owner has changed and this remote is stale; this key is not a "
-    "member of the repo's bound channel; or the relay is up but its proxy has "
-    "no backend. The label above says auth because the URL is a Buzz one, not "
-    "because the key was checked.\n\n"
+    "member of the repo's bound channel; the announcement exists but the repo "
+    "behind it never did; or the relay is up and its proxy has no backend. The "
+    "label above says auth because the URL is a Buzz one, not because the key "
+    "was checked.\n\n"
     "In that order of cost to check:\n"
-    "1. `buzz repos get --id <id>` and compare the `clone` tag to the remote\n"
-    "2. `buzz channels members --channel <the announcement's buzz-channel>`\n"
-    "3. whether the relay was restarting at this timestamp"
+    "1. `git ls-remote <clone tag>` - NOT `buzz repos get`. A stored "
+    "announcement proves an event was accepted, not that a repo exists: the "
+    "relay inserts the event before its side effects and only logs a failure, "
+    "so a matching `clone` tag can front nothing at all.\n"
+    "2. compare that `clone` tag to the remote actually configured here\n"
+    "3. `buzz channels members --channel <the announcement's buzz-channel>`\n"
+    "4. whether the relay was restarting at this timestamp"
 )
 
 GIT_TRIES = 3        # attempts per network operation within one tick
@@ -855,6 +869,13 @@ def tick():
             # reason, so a real auth failure arriving while a 5xx halt is live
             # must post as its own message, not be swallowed by it.
             msg = str(e)
+            # cli_retryable returns None on every path that reaches here today:
+            # the only buzz_cli callers left are post() and open_pr(), and both
+            # swallow their own exceptions, so a buzz-CLI error never surfaces
+            # in this handler. Kept because that is a property of the current
+            # call graph rather than a rule, and the day a CLI error does reach
+            # here the flag is the better answer. Untested on purpose - there is
+            # no way to exercise it without inventing a caller.
             verdict = cli_retryable(e)
             transient = bool(TRANSIENT.search(msg)) if verdict is None else verdict
             if "buzz.gitcoin.co" in msg or "not a relay member" in msg:
