@@ -579,8 +579,9 @@ GITHUB_404 = (
     "revoked in it.\n\n"
     "Check, in that order:\n"
     "1. whether the repo still exists under that owner and name\n"
-    "2. whether the App's installation still lists it - a grant is per "
-    "repository, and a repo added to the org after the grant is not in it\n"
+    "2. whether the installation covers it - if it is set to selected "
+    "repositories, one added since the grant is not in it; if it is set to all "
+    "repositories, new ones are picked up and this is not your cause\n"
     "3. whether the repo went private\n\n"
     "None of the relay's checks apply here. The mirror's Buzz side is fine."
 )

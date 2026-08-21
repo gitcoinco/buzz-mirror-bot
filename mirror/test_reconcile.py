@@ -871,7 +871,7 @@ check("and it sends the reader to ls-remote, not to `buzz repos get`",
       any("git ls-remote" in p for p in POSTS)
       and any("not that a repo exists" in p for p in POSTS))
 check("and it does NOT carry the GitHub note",
-      not any("App's installation still lists it" in p for p in POSTS))
+      not any("whether the installation covers it" in p for p in POSTS))
 
 
 def boom_gh_not_found(buzz_owner, repo_id, gh_repo, tok, st):
@@ -893,7 +893,7 @@ check("and it is labelled as a GitHub auth failure",
 check("and it does NOT carry the relay's ambiguity note",
       not any("ambiguous by design" in p for p in POSTS))
 check("and it carries the GitHub one instead",
-      any("App's installation still lists it" in p for p in POSTS))
+      any("whether the installation covers it" in p for p in POSTS))
 check("which does not send the reader to the relay",
       not any("buzz channels members" in p for p in POSTS))
 
