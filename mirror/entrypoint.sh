@@ -1,9 +1,11 @@
 #!/bin/sh
 # Get a GitHub credential into place, then run the mirror.
 #
-# The deployed shape supplies GITHUB_INSTALLATION_TOKEN: infra-box's issuer
-# holds the App's PEM and hands out installation tokens that expire in an hour.
-# Nothing to unpack, and no long-lived key is ever inside this container.
+# The deployed shape supplies tokens: infra-box's issuer holds the App's PEM and
+# hands out installation tokens that expire in an hour. Nothing to unpack, and
+# no long-lived key is ever inside this container. Either GITHUB_OWNERS with one
+# GITHUB_INSTALLATION_TOKEN_<OWNER> per named account, or the older single
+# GITHUB_INSTALLATION_TOKEN.
 #
 # The PEM path below is the fallback for a deployment with no issuer - loop mode
 # somewhere else, or a laptop. There the key arrives as an env var, which is
@@ -13,7 +15,12 @@
 
 set -eu
 
-if [ -n "${GITHUB_INSTALLATION_TOKEN:-}" ]; then
+# GITHUB_OWNERS is checked as well as the singular token, and it has to be:
+# with two or more accounts the launcher deliberately leaves the singular unset
+# (an older image would read it and mirror only one account). Testing only the
+# singular sent the multi-account shape down the PEM branch, where it exited 1
+# asking for a key that is not supposed to be in this container.
+if [ -n "${GITHUB_INSTALLATION_TOKEN:-}" ] || [ -n "${GITHUB_OWNERS:-}" ]; then
     if [ -n "${BUZZ_PRIVATE_KEY:-}" ] && [ -z "${NOSTR_PRIVATE_KEY:-}" ]; then
         NOSTR_PRIVATE_KEY="$BUZZ_PRIVATE_KEY"
         export NOSTR_PRIVATE_KEY

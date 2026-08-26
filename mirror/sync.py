@@ -130,6 +130,59 @@ for _o in BUZZ_OWNERS:
 # installation-WIDE, not narrowed to a repo list - see discover_github().
 INSTALL_TOKEN = os.environ.get("GITHUB_INSTALLATION_TOKEN", "")
 
+
+def token_var(owner):
+    """The env var carrying one account's installation token.
+
+    Uppercased, with every character an env var name cannot hold replaced by
+    `_`: GitHub account names allow hyphens and env var names do not. aei's
+    host/buzz-mirror-run-once.sh derives the same name from the same owner list
+    before it mints anything, so this rule is a contract across two repos.
+    Change it on one side and that account arrives with no credential.
+    """
+    return "GITHUB_INSTALLATION_TOKEN_" + re.sub(r"[^A-Z0-9]", "_", owner.upper())
+
+
+def read_owner_tokens(environ):
+    """[(owner, token)] from GITHUB_OWNERS, or [] when it is unset.
+
+    One token per GitHub account, because a token is only ever valid for ONE
+    installation and the fleet's repos are not all in one account: the mirrored
+    repos are granted under irlfund, and this mirror's own GitHub half lives
+    under gitcoinco. Its enrolment set is the union of the grants.
+
+    Separators are commas and/or whitespace, matching BUZZ_REPO_OWNER above -
+    the file this comes from on infra-box is *sourced as bash*, where an
+    unquoted space is a syntax error, so the comma form is the one to write and
+    the whitespace form is accepted so the quoted spelling is not a trap.
+
+    A named account with no token is fatal rather than skipped. Skipping it
+    would drop every repo in that account out of the mirror set and log a
+    perfectly clean run, which is the silent stop this daemon exists to prevent.
+    """
+    owners, seen = [], set()
+    for o in re.split(r"[,\s]+", environ.get("GITHUB_OWNERS", "").strip()):
+        if not o or o.lower() in seen:
+            continue  # a repeat is a typo; one token per account either way
+        seen.add(o.lower())
+        owners.append(o)
+
+    out = []
+    for o in owners:
+        var = token_var(o)
+        tok = environ.get(var, "")
+        if not tok:
+            raise SystemExit(
+                f"GITHUB_OWNERS names {o!r} but {var} is empty - the caller "
+                f"mints one installation-wide token per account and passes it "
+                f"in under that name (see aei host/buzz-mirror-run-once.sh)"
+            )
+        out.append((o, tok))
+    return out
+
+
+INSTALL_TOKENS = read_owner_tokens(os.environ)
+
 for gone, why in (
     ("MIRROR_REPOS", "repos are discovered from the Buzz announcement's `web` tag "
                      "plus the GitHub App's grants"),
@@ -300,18 +353,52 @@ def repos_for_token(tok, label):
     return repos
 
 
+def merge_grants(into, more, label):
+    """Union one installation's grants into the set, refusing a repeat.
+
+    Not `dict.update`: that keeps the last token seen and says nothing. A repo
+    reachable from two installations means the two tokens disagree about who
+    owns it, and picking one would make the mirror's behaviour depend on the
+    order GitHub happened to list the installations in. There is no safe guess,
+    so the run fails and a human looks.
+
+    Ordinarily unreachable - a repo lives under exactly one account - but a
+    transfer between two accounts the App is installed on can leave both
+    installations claiming it for a while.
+    """
+    for key, val in more.items():
+        if key in into:
+            raise RuntimeError(
+                f"{val[0]} is granted in two installations (the second is "
+                f"{label}) - one repo, two tokens, no way to tell which is "
+                f"current; revoke the grant on the account that no longer "
+                f"owns it"
+            )
+        into[key] = val
+    return into
+
+
 def discover_github():
     """Every repo the App has actually been granted, with a token that reaches it.
 
-    Two ways in, and the deployed one is the token.
+    Three ways in, and the deployed one is the owner list.
 
-    **GITHUB_INSTALLATION_TOKEN** - minted by the issuer on infra-box, which is
-    the only place the App's PEM lives. The mirror then holds a credential that
-    expires in an hour rather than one that never does. The token must be
-    installation-WIDE: the issuer can narrow a token to a repo list, and doing
-    that here would quietly move enrolment out of the App grant and into the
-    issuer's flags, which is exactly the thing enrolment is not allowed to be.
-    Granted means fully enrolled; this function is how that is read.
+    **GITHUB_OWNERS plus one GITHUB_INSTALLATION_TOKEN_<OWNER> each** - the
+    issuer on infra-box mints one installation-wide token per named account and
+    the caller passes them in. A GitHub App token is only ever valid for ONE
+    installation, so an App installed on several accounts needs several tokens;
+    the mirror set is their union. This is what lets the mirror carry a repo
+    outside the account holding everything else - see docs/MIRROR.md.
+
+    **GITHUB_INSTALLATION_TOKEN**, one token, one account. The original shape,
+    kept working because this image and aei's launcher are separate artifacts
+    that deploy independently: whichever lands first, the tick still runs.
+
+    Either way the token must be installation-WIDE: the issuer can narrow a
+    token to a repo list, and doing that here would quietly move enrolment out
+    of the App grant and into the issuer's flags, which is exactly the thing
+    enrolment is not allowed to be. Granted means fully enrolled; this function
+    is how that is read.
 
     **The PEM**, for a deployment with no issuer (loop mode, a laptop). An App
     set to "Any account" gets a *separate installation per account*, each with
@@ -320,10 +407,18 @@ def discover_github():
     ids are derivable from the PEM, so they are discovered rather than being
     values a human has to find and copy. There is no App-JWT endpoint that lists
     an installation's repositories, so a token per installation is the only way
-    to see inside one.
+    to see inside one. This path finds every installation; the two token paths
+    above see only the accounts they were given, which is the point of naming
+    them.
 
     Returns {lowercased owner/name: (owner/name, token)}.
     """
+    if INSTALL_TOKENS:
+        repos = {}
+        for owner, tok in INSTALL_TOKENS:
+            merge_grants(repos, repos_for_token(tok, f"{owner} installation token"), owner)
+        return repos
+
     if INSTALL_TOKEN:
         return repos_for_token(INSTALL_TOKEN, "installation token")
 
@@ -333,7 +428,8 @@ def discover_github():
         tok = api(
             f"/app/installations/{inst['id']}/access_tokens", j, method="POST"
         )["token"]
-        repos.update(repos_for_token(tok, inst["account"]["login"]))
+        login = inst["account"]["login"]
+        merge_grants(repos, repos_for_token(tok, login), login)
     return repos
 
 
