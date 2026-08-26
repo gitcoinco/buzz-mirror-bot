@@ -365,12 +365,24 @@ mirror are both down there is no path from Buzz to GitHub at all until one of th
 nothing here changes that. Deliberately not solved: the fix would be a second copy of the source
 of truth, which is a larger commitment than the failure justifies.
 
-**Not run end to end.** Nothing here has infra-box access, so this is assembled from the scripts
-that do the same thing daily rather than from a live execution. The three failure modes it works
-around were found by judgebot in review of the commit that first wrote this section, when it was
-three lines that would each have failed. **If you have infra-box access and you have just walked
-these commands for real, delete this paragraph in the same commit** — that is the only way it ever
-goes away, and a permanent "unverified" label stops being information.
+**Partly executed, and here is the line.** The `git clone` was run verbatim against the live relay
+on 2026-08-26 — full owner hex, `credential.helper`, `credential.useHttpPath=true`,
+`NOSTR_PRIVATE_KEY` exported — and it cloned, `HEAD` at `e35d4c5` on `main`. So the URL, the hex,
+the helper flags and the relay's answer are confirmed rather than assembled. It was run from a
+seat with git 2.47.3 and its own key, not from infra-box and not as mirror-bot. `mirror-bot`'s key
+`3f548262…` was in the `ffaf8f45` member list on the same date, checked twice independently, so
+the clone has read access as the runbook would actually run it — a snapshot, not a guarantee.
+
+What is still unproven is the docker wrapper around that clone and the bind mount, on infra-box.
+`IMG=$(ensure_buzz_git_image)` is safe to capture: that function writes build progress to stderr
+and only the tag to stdout (aei `host/buzz-git-image.sh:22`), so a first-run build cannot end up
+inside `$IMG`.
+
+The three failure modes this works around were found by judgebot reviewing the commit that first
+wrote this section, when it was three lines that would each have failed. **If you have infra-box
+access and you have just walked these commands for real, delete these two paragraphs in the same
+commit** — that is the only way they go away, and a permanent "unverified" label stops being
+information.
 
 Two things make the deadlock less likely than it was. A broken tick exits non-zero and the unit's
 `OnFailure=` says so, where the Action failed into an email nobody had to act on. And
