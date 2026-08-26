@@ -371,6 +371,119 @@ check("the token's own grants are the mirror set",
       ["irlfund/agentic-engineering-infra", "irlfund/local-almanac", "irlfund/regenOS"])
 sync.INSTALL_TOKEN = ""
 
+# --- more than one installation ---------------------------------------------
+#
+# A token is valid for exactly one installation, so an App installed on several
+# accounts needs several tokens. This is what lets the mirror carry a repo
+# outside the account that holds everything else - concretely, its own GitHub
+# half under gitcoinco while the mirrored repos are granted under irlfund.
+
+check("GITHUB_OWNERS unset is not the same as empty", sync.read_owner_tokens({}) == [])
+check("an account name becomes an env var name",
+      sync.token_var("gitcoinco") == "GITHUB_INSTALLATION_TOKEN_GITCOINCO")
+# GitHub account names allow hyphens; env var names do not. aei's launcher
+# derives the same name from the same list, so this translation is a contract
+# between the two repos rather than a local detail.
+check("a hyphen in the account name becomes an underscore",
+      sync.token_var("Some-Org") == "GITHUB_INSTALLATION_TOKEN_SOME_ORG")
+
+ENV_2 = {"GITHUB_OWNERS": "irlfund,gitcoinco",
+         "GITHUB_INSTALLATION_TOKEN_IRLFUND": "tok-11",
+         "GITHUB_INSTALLATION_TOKEN_GITCOINCO": "tok-22"}
+check("commas separate the list",
+      sync.read_owner_tokens(ENV_2) == [("irlfund", "tok-11"), ("gitcoinco", "tok-22")])
+# The env file this comes from is sourced as bash, where an unquoted space is a
+# syntax error. Comma is the form to write there; whitespace is accepted so the
+# quoted spelling is not a trap either.
+check("whitespace separates the list too, and order is preserved",
+      sync.read_owner_tokens(dict(ENV_2, GITHUB_OWNERS=" gitcoinco   irlfund ")) ==
+      [("gitcoinco", "tok-22"), ("irlfund", "tok-11")])
+check("a repeated account is read once",
+      sync.read_owner_tokens(dict(ENV_2, GITHUB_OWNERS="irlfund, irlfund ,gitcoinco")) ==
+      [("irlfund", "tok-11"), ("gitcoinco", "tok-22")])
+
+# Fatal, not skipped. Skipping would drop every repo in that account and log a
+# clean run - the silent stop this daemon exists to prevent.
+try:
+    sync.read_owner_tokens({"GITHUB_OWNERS": "irlfund,gitcoinco",
+                            "GITHUB_INSTALLATION_TOKEN_IRLFUND": "tok-11"})
+    check("a named account with no token refuses to start", False)
+except SystemExit as e:
+    check("a named account with no token refuses to start", True)
+    check("and the message names the account and the variable",
+          "gitcoinco" in str(e) and "GITHUB_INSTALLATION_TOKEN_GITCOINCO" in str(e))
+
+# token_var() exists twice: here, and in bash in aei's launcher. `tr` maps bytes
+# and str.upper() maps Unicode, so they agree on ASCII letters/digits/hyphen and
+# only there - "ß".upper() is "SS" to python and two underscores to tr. Both
+# sides refuse anything outside that set, so the contract is exact rather than
+# nearly exact, and a bad entry is named as a bad entry instead of surfacing as
+# a token that went missing.
+for junk in ("gitcoinß", "org.name", "o/rg", "org_name"):
+    try:
+        sync.read_owner_tokens({"GITHUB_OWNERS": junk})
+        check(f"an account name outside [A-Za-z0-9-] is refused: {junk!r}", False)
+    except SystemExit as e:
+        check(f"an account name outside [A-Za-z0-9-] is refused: {junk!r}",
+              "not a GitHub account name" in str(e))
+check("a hyphen is still allowed",
+      sync.read_owner_tokens({"GITHUB_OWNERS": "my-org",
+                              "GITHUB_INSTALLATION_TOKEN_MY_ORG": "t"}) == [("my-org", "t")])
+
+API_CALLS.clear()
+sync.INSTALL_TOKENS = sync.read_owner_tokens(ENV_2)
+gh = sync.discover_github()
+check("the mirror set is the union of both installations' grants",
+      sorted(v[0] for v in gh.values()) ==
+      ["gitcoinco/some-org-repo", "irlfund/agentic-engineering-infra",
+       "irlfund/local-almanac", "irlfund/regenOS"])
+check("each repo carries the token for its own account",
+      gh["irlfund/regenos"][1] == "tok-11" and gh["gitcoinco/some-org-repo"][1] == "tok-22")
+check("supplied tokens are still used as-is, with no App JWT",
+      "/app/installations" not in " ".join(API_CALLS)
+      and not any("access_tokens" in c for c in API_CALLS))
+# A stranger installing an "Any account" App must gain nothing. The PEM path
+# walks every installation; naming the accounts is what bounds this one.
+check("an installation nobody named is never read",
+      not any(v[0].startswith("someone-else/") for v in gh.values()))
+
+# The point of the whole change: a repo in the second account now mirrors.
+sync.buzz_cli = lambda *a: json.dumps(dict(
+    BUZZ_REPOS_BY_OWNER,
+    **{OWNER2: BUZZ_REPOS_BY_OWNER[OWNER2] + [
+        {"tags": [["d", "mirror-bot"],
+                  ["web", "https://github.com/gitcoinco/some-org-repo"]]}]},
+).get(a[-1], []))
+pairs, ok = sync.discover()
+by_id = {r: (g, t) for r, _, g, t in pairs}
+check("a repo in the second account mirrors, carrying that account's token",
+      by_id.get("mirror-bot") == ("gitcoinco/some-org-repo", "tok-22"))
+check("adding a second account does not disturb the first",
+      by_id["regenos-dev"] == ("irlfund/regenOS", "tok-11"))
+
+# With only the first account configured, that same repo is announced-but-not-
+# granted: skipped and silent, never halted. That is today's behaviour and it
+# is why mirror-bot has needed the GitHub Action.
+sync.INSTALL_TOKENS = sync.read_owner_tokens(
+    {"GITHUB_OWNERS": "irlfund", "GITHUB_INSTALLATION_TOKEN_IRLFUND": "tok-11"})
+pairs, ok = sync.discover()
+check("one account configured: the other account's repo is skipped, not halted",
+      "mirror-bot" not in [r for r, _, _, _ in pairs] and ok)
+
+# One repo reachable from two installations means two tokens disagree about who
+# owns it. dict.update would keep whichever GitHub listed last.
+sync.INSTALL_TOKENS = [("irlfund", "tok-11"), ("clone-of-irlfund", "tok-11")]
+try:
+    sync.discover_github()
+    check("a repo granted in two installations fails the run", False)
+except RuntimeError as e:
+    check("a repo granted in two installations fails the run", True)
+    check("and the message names a repo and says to revoke one grant",
+          "irlfund/" in str(e) and "revoke" in str(e))
+
+sync.INSTALL_TOKENS = []
+sync.buzz_cli = lambda *a: json.dumps(BUZZ_REPOS_BY_OWNER.get(a[-1], []))
+
 # Two buzz repos claiming one GitHub repo would take turns fast-forwarding the
 # same main from unrelated histories. There is no safe guess about which wins,
 # so both are dropped and the run fails rather than thrashing quietly.

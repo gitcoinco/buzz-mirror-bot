@@ -72,18 +72,28 @@ The fallback is not matched on the relay's denial text — a transient network f
 too, and the proposal's own push fails the same way, which halts as a reconcile failure.
 Guessing which one it was would only add a way to guess wrong.
 
-**As of 2026-08-09 no repo uses this path.** All four carry
-`push:member no-force-push no-delete` on `refs/heads/main`:
+**This path is live again for some repos.** The 2026-08-09 state below was
+`push:member no-force-push no-delete` everywhere, which meant nothing used it. The repos have
+since moved to the `afd48fef…` (repobot) owner and were re-announced, and the announcements
+now differ. Read from `buzz repos list --owner afd48fef…` on 2026-08-26:
 
-| repo | | |
+| repo id | `refs/heads/main` | |
 |---|---|---|
-| `regenos-dev` | `push:member` | app repo |
-| `local-almanac-mirror` | `push:member` | app repo |
-| `agentic-engineering-infra` | `push:member` | control plane — see the note below |
-| `buzz-mirror-bot` | `push:member` | not in the mirror set anyway (`GITHUB_OWNER`) |
+| `regenos` | `no-force-push no-delete` | the daemon can adopt a GitHub-ahead tip directly |
+| `almanac-mirror` | `no-force-push no-delete` | same |
+| `aei` | `push:owner` | control plane — see the note below |
+| `mirror-bot` | `push:owner` | proposes; see below |
 
-That is a deliberate call by the owner (2026-08-09): agentic upgrade of the fleet is worth more
-right now than the review gate, and the flip back is one republished announcement per repo.
+`push:owner` means the *repo owner's* key, which is repobot (`afd48fef…`). The daemon signs as
+mirror-bot (`3f548262…`), so on those two repos the relay refuses its push and it opens a PR
+instead. That only bites when **GitHub** is the ahead side. Buzz-ahead is the normal direction and
+is pushed to GitHub with the App token, which no Buzz protection gates.
+
+The `push:member` state was a deliberate call by the owner (2026-08-09): agentic upgrade of the
+fleet is worth more right now than the review gate, and the flip back is one republished
+announcement per repo. It has since flipped back for `aei` and `mirror-bot`, which is what the
+table above records. The analysis below describes what `push:member` bought while it was on; it is
+kept because the flip is a republished announcement away in either direction.
 
 For **aei** it is worth being precise about what that buys and costs, because aei's build is a
 converge that ends in `tofu apply` as root. The gate it removes is *not* the one it looks like:
@@ -293,34 +303,56 @@ infra-box `/root/fleet-dispatch/secrets/gitcoinco_buzz-mirror-bot`. In aei that 
 `github` provider alias for `gitcoinco` alongside the `irlfund` one in `tofu/github.tf`. Until it
 exists, the image is built by hand or by re-delivering a push.
 
-### Do not let the mirror mirror itself
+### The mirror mirrors itself, and how to recover when that bites
 
-`buzz-mirror-bot`'s own image is built from its GitHub `main`, and GitHub would be fed by the
+Until 2026-08-26 this section said the opposite, so the reasoning is worth keeping rather than
+deleting. `buzz-mirror-bot`'s own image is built from its GitHub `main`, and GitHub is fed by the
 mirror. If the mirror breaks, a fix pushed to Buzz cannot reach GitHub, so it cannot be built, so
-it stays broken.
+it stays broken. The old answer was to keep `.github/workflows/buzz-mirror-main.yml` on this repo
+alone, as a second path from Buzz to GitHub that does not depend on the daemon.
 
-**Keep `.github/workflows/buzz-mirror-main.yml` on `buzz-mirror-bot` specifically.** Everywhere
-else it is exactly the per-repo cost this replaces and should be deleted once the mirror is proven.
-Here it is not redundancy — it is the only thing that breaks the deadlock.
+The exclusion was structural, not a rule anyone had to remember. `buzz-mirror-bot` satisfied the
+*Buzz* half of enrolment — announced under `BUZZ_REPO_OWNER` with a `web` tag pointing at
+`github.com/gitcoinco/buzz-mirror-bot`. The *GitHub* half kept it out: a token is only ever valid
+for one installation, `GITHUB_OWNER` named exactly one account, and `/installation/repositories`
+can only answer with repos from that one. `gitcoinco` was not it.
 
-The exclusion is also structural, and it is worth naming because it is easy to break by accident.
-`buzz-mirror-bot` satisfies the *Buzz* half of enrolment today — it is announced under
-`BUZZ_REPO_OWNER` with a `web` tag pointing at `github.com/gitcoinco/buzz-mirror-bot`. What keeps
-it out of the mirror set is the *GitHub* half: a token is only ever valid for one installation, so
-`GITHUB_OWNER` names exactly one account and `/installation/repositories` can only ever answer with
-repos from that one. Enrolment is therefore "granted to the App **in the `GITHUB_OWNER`
-installation**", and `gitcoinco` is not it.
+**That is retired as an accepted risk, on the owner's call (lucian, 2026-08-26).** The Action had
+been failing every ten minutes since the repos moved owner — its `BUZZ_REPO_URL` still names the
+dead `20498bf7…` coordinate — and a protection nobody can distinguish from a broken cron is not a
+protection. `GITHUB_OWNERS` naming both accounts is what lets the daemon carry `mirror-bot` like
+anything else.
 
-So the App can be installed on `gitcoinco` to build the mirror image without enrolling the mirror
-in itself. The thing that would break the deadlock protection is pointing `GITHUB_OWNER` at
-`gitcoinco`, not granting the App there.
+`.github/workflows/buzz-mirror-main.yml` is **still in this repo** as of this commit. It is
+deleted in a separate PR, after a tick has been seen logging `mirroring mirror-bot ->
+gitcoinco/buzz-mirror-bot`. Deleting it before that would leave no path from Buzz to GitHub at
+all if the enrolment does not take.
+
+What was bought was an *automatic* way out of a rare failure. The manual way out is unchanged, and
+it is three commands. Run them on infra-box when the daemon is broken and the fix is on Buzz:
+
+```sh
+git clone https://buzz.gitcoin.co/git/afd48fef…/mirror-bot.git /tmp/fix && cd /tmp/fix
+tok=$(/home/lucian/agentic-engineering-infra/host/gh-app-token.sh --owner gitcoinco)
+git push "https://x-access-token:$tok@github.com/gitcoinco/buzz-mirror-bot.git" HEAD:main
+```
+
+The dispatcher builds from that push and the new image is pinned in aei
+`host/buzz-mirror-image-tag`. Cloning from Buzz needs `NOSTR_PRIVATE_KEY` set to a key that is a
+member of the bound channel.
+
+Two things make the deadlock less likely than it was. A broken tick exits non-zero and the unit's
+`OnFailure=` says so, where the Action failed into an email nobody had to act on. And
+`mirror-bot`'s `main` is `push:owner` while the daemon signs as `mirror-bot`, so on the one
+direction it cannot push — GitHub ahead of Buzz — it opens a PR rather than halting.
 
 ### Configuration
 
 | var | what |
 |---|---|
 | `MIRROR_IMAGE` | the image `run-once.sh` runs. **Required** |
-| `GITHUB_OWNER` | the App installation to mirror, e.g. `irlfund`. **Required** |
+| `GITHUB_OWNERS` | the App installations to mirror, e.g. `irlfund,gitcoinco`. Commas or whitespace; the env file is sourced as bash, so the comma form needs no quoting. **Required** |
+| `GITHUB_OWNER` | *deprecated.* The singular form, one account. Still honoured, and means a one-account list |
 | `BUZZ_PRIVATE_KEY` | mirror-bot's nostr key. Must be a member of every bound channel |
 | `BUZZ_AUTH_TAG` | NIP-OA owner attestation |
 | `BUZZ_REPO_OWNER` | announcing pubkey(s), 64-char hex, comma-separated. Repo ids are reserved to their creating key forever, so repos announced by different keys can only ever be followed as a list |
@@ -328,20 +360,34 @@ in itself. The thing that would break the deadlock protection is pointing `GITHU
 | `GH_APP_TOKEN_CMD` | *optional.* Issuer path. Default `/usr/local/bin/gh-app-token` |
 | `MIRROR_INTERVAL_SECS` | loop mode only; ignored by `--once`. Default 60 |
 
-**No GitHub credential appears here.** `run-once.sh` mints
-`GITHUB_INSTALLATION_TOKEN` per run and passes it with `-e GITHUB_INSTALLATION_TOKEN` — no value
-on the command line, so it never lands in `argv` or `ps`. It expires in an hour whatever happens
-to it.
+**No GitHub credential appears here.** `run-once.sh` mints one token per named account per run and
+passes each with `-e GITHUB_INSTALLATION_TOKEN_<OWNER>` — no value on the command line, so none of
+them lands in `argv` or `ps`. They expire in an hour whatever happens to them.
 
-That token must be **installation-wide**: `run-once.sh` calls the issuer with `--owner
-"$GITHUB_OWNER"` and no `--repos`. The issuer can narrow a token to a repo list, which is right for
-build-box — it only needs `contents: read` on the repos it builds — and wrong here: the mirror set
-*is* the App's grants, so a narrowed token would quietly move enrolment out of the App install UI
-and into a config file. Granted means fully enrolled.
+`<OWNER>` is the account name uppercased, with every character an env var name cannot hold
+replaced by `_`: GitHub account names allow hyphens and env var names do not, so `some-org`
+becomes `GITHUB_INSTALLATION_TOKEN_SOME_ORG`. **This rule is a contract with aei.**
+`host/buzz-mirror-run-once.sh` derives the same name from the same list before it mints anything,
+and `sync.token_var()` derives it again to read it back. Change it on one side and that account
+arrives with no credential — which is a refusal to start, not a silent skip, on purpose.
 
-`--owner` is not optional in practice. A token is only valid for the installation that issued it,
-and the App is installed on more than one account, so the issuer's omit-when-there-is-exactly-one
-shortcut does not apply.
+With exactly one account the launcher also sets the old singular `GITHUB_INSTALLATION_TOKEN`, so
+an image from before this change keeps working. With two or more it leaves the singular unset: an
+older image would otherwise read it, mirror that one account, and log a clean `ok` while every
+repo in the other account sat out.
+
+Each token must be **installation-wide**: `run-once.sh` calls the issuer with `--owner "$o"` and
+no `--repos`. The issuer can narrow a token to a repo list, which is right for build-box — it only
+needs `contents: read` on the repos it builds — and wrong here: the mirror set *is* the App's
+grants, so a narrowed token would quietly move enrolment out of the App install UI and into a
+config file. Granted means fully enrolled.
+
+`--owner` is not optional, and it is one call per account: the issuer refuses to mix owners in a
+single token, because a token is only valid for the installation that issued it.
+
+Naming the accounts is also what bounds an "Any account" App. The PEM path below walks every
+installation it can see; the token path reads only the accounts it was given, so a stranger who
+installs the App gains nothing even if they announce a repo.
 
 **There is no repo list.** `MIRROR_REPOS` and `MIRROR_ONLY` are both gone; setting either is a
 hard startup error rather than a silently ignored value. See
@@ -415,8 +461,9 @@ After **Create GitHub App**:
 
 An App set to *Any account* gets a **separate installation for every account it is installed on**,
 each with its own id and its own tokens. A token minted for one installation is not valid for
-another, so the unit of authentication is the *account*, not the App. Discovery walks every
-installation and pairs each repo with the token for *its own* account.
+another, so the unit of authentication is the *account*, not the App. Either way each repo is
+paired with the token for *its own* account. On the PEM path discovery walks every installation it
+can see; on the deployed token path it reads the accounts named in `GITHUB_OWNERS` and no others.
 
 Three consequences worth knowing:
 
