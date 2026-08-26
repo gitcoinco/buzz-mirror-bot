@@ -380,9 +380,12 @@ inside `$IMG`.
 
 The three failure modes this works around were found by judgebot reviewing the commit that first
 wrote this section, when it was three lines that would each have failed. **If you have infra-box
-access and you have just walked these commands for real, delete these two paragraphs in the same
-commit** — that is the only way they go away, and a permanent "unverified" label stops being
-information.
+access and you have just walked these commands for real, delete the two paragraphs above — from
+"Partly executed" through the `ensure_buzz_git_image` note — in the same commit.** That is the
+only way they go away, and a permanent "unverified" label stops being information.
+
+Leave "It assumes the relay is reachable" where it is. That one is a design decision, not a
+verification status, and walking the runbook does not retire it.
 
 Two things make the deadlock less likely than it was. A broken tick exits non-zero and the unit's
 `OnFailure=` says so, where the Action failed into an email nobody had to act on. And
