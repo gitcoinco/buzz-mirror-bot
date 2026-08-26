@@ -360,10 +360,17 @@ go through the image. The dispatcher builds from that push, and the new image is
 The owner hex is written out in full rather than elided, because the whole point of a runbook is
 that it can be pasted during an outage.
 
+**It assumes the relay is reachable.** Every command above reads from Buzz. If the relay and the
+mirror are both down there is no path from Buzz to GitHub at all until one of them recovers, and
+nothing here changes that. Deliberately not solved: the fix would be a second copy of the source
+of truth, which is a larger commitment than the failure justifies.
+
 **Not run end to end.** Nothing here has infra-box access, so this is assembled from the scripts
 that do the same thing daily rather than from a live execution. The three failure modes it works
 around were found by judgebot in review of the commit that first wrote this section, when it was
-three lines that would each have failed.
+three lines that would each have failed. **If you have infra-box access and you have just walked
+these commands for real, delete this paragraph in the same commit** — that is the only way it ever
+goes away, and a permanent "unverified" label stops being information.
 
 Two things make the deadlock less likely than it was. A broken tick exits non-zero and the unit's
 `OnFailure=` says so, where the Action failed into an email nobody had to act on. And
