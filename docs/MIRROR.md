@@ -328,18 +328,42 @@ deleted in a separate PR, after a tick has been seen logging `mirroring mirror-b
 gitcoinco/buzz-mirror-bot`. Deleting it before that would leave no path from Buzz to GitHub at
 all if the enrolment does not take.
 
-What was bought was an *automatic* way out of a rare failure. The manual way out is unchanged, and
-it is three commands. Run them on infra-box when the daemon is broken and the fix is on Buzz:
+What was bought was an *automatic* way out of a rare failure. The manual way out is unchanged.
+Run this on infra-box, as root, when the daemon is broken and the fix is on Buzz.
+
+A plain `git clone` of a Buzz remote does not work on that host, so this is longer than it looks
+like it should be. Ubuntu's git is older than 2.46, and below that `git-credential-nostr` silently
+no-ops — no `capability[]=authtype` line, so the relay 401s with a misleading "Everything
+up-to-date" (aei `host/buzz-git-image.sh:8`). Every host script that touches a Buzz remote runs
+the *network* git inside the shared `buzz-git` image for that reason; local reads and commits are
+fine with host git. This copies the shape of aei `host/skills-sync-run-once.sh:41-52`.
 
 ```sh
-git clone https://buzz.gitcoin.co/git/afd48fef…/mirror-bot.git /tmp/fix && cd /tmp/fix
-tok=$(/home/lucian/agentic-engineering-infra/host/gh-app-token.sh --owner gitcoinco)
-git push "https://x-access-token:$tok@github.com/gitcoinco/buzz-mirror-bot.git" HEAD:main
+cd /home/lucian/agentic-engineering-infra/host
+. ./buzz-git-image.sh; IMG=$(ensure_buzz_git_image)   # builds on first use, a few minutes
+set -a; . /etc/buzz-mirror/env; set +a                # BUZZ_PRIVATE_KEY, BUZZ_AUTH_TAG
+export NOSTR_PRIVATE_KEY="$BUZZ_PRIVATE_KEY"          # git-credential-nostr's spelling
+
+mkdir -p /tmp/fix
+docker run --rm -v /tmp/fix:/tmp/fix -e NOSTR_PRIVATE_KEY -e BUZZ_AUTH_TAG "$IMG" \
+    git -c credential.helper=/usr/local/bin/git-credential-nostr -c credential.useHttpPath=true \
+    clone https://buzz.gitcoin.co/git/afd48fef3adfa4f1e794f6ce0b1f640d74c02cbadd0d2c8d0426bc3215c370b4/mirror-bot.git /tmp/fix/mirror-bot
+
+tok=$(./gh-app-token.sh --owner gitcoinco)
+git -C /tmp/fix/mirror-bot push "https://x-access-token:$tok@github.com/gitcoinco/buzz-mirror-bot.git" HEAD:main
 ```
 
-The dispatcher builds from that push and the new image is pinned in aei
-`host/buzz-mirror-image-tag`. Cloning from Buzz needs `NOSTR_PRIVATE_KEY` set to a key that is a
-member of the bound channel.
+The push is host git on purpose: `github.com` needs no credential helper, so only the clone has to
+go through the image. The dispatcher builds from that push, and the new image is pinned in aei
+`host/buzz-mirror-image-tag`.
+
+The owner hex is written out in full rather than elided, because the whole point of a runbook is
+that it can be pasted during an outage.
+
+**Not run end to end.** Nothing here has infra-box access, so this is assembled from the scripts
+that do the same thing daily rather than from a live execution. The three failure modes it works
+around were found by judgebot in review of the commit that first wrote this section, when it was
+three lines that would each have failed.
 
 Two things make the deadlock less likely than it was. A broken tick exits non-zero and the unit's
 `OnFailure=` says so, where the Action failed into an email nobody had to act on. And

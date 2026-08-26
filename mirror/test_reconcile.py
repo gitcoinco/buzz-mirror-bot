@@ -470,6 +470,23 @@ pairs, ok = sync.discover()
 check("one account configured: the other account's repo is skipped, not halted",
       "mirror-bot" not in [r for r, _, _, _ in pairs] and ok)
 
+# Precedence, pinned because nothing else pins it. Swapping the two branches in
+# discover_github() leaves every other check in this file green, and the flip is
+# silent: the singular reaches one account, so that account's repos sync while
+# the other's log as announced-but-not-granted and the run exits 0 logging `ok`.
+# The launcher cannot produce both today - it withholds the singular whenever
+# there are two or more owners - but a hand-run with a stale
+# GITHUB_INSTALLATION_TOKEN still exported can, and that is the shape someone
+# reaches for while debugging. Found by judgebot as a surviving mutant.
+sync.INSTALL_TOKENS = sync.read_owner_tokens(ENV_2)
+sync.INSTALL_TOKEN = "tok-11"
+gh = sync.discover_github()
+check("the owner list wins over a stale singular token, not the other way round",
+      sorted(v[0] for v in gh.values()) ==
+      ["gitcoinco/some-org-repo", "irlfund/agentic-engineering-infra",
+       "irlfund/local-almanac", "irlfund/regenOS"])
+sync.INSTALL_TOKEN = ""
+
 # One repo reachable from two installations means two tokens disagree about who
 # owns it. dict.update would keep whichever GitHub listed last.
 sync.INSTALL_TOKENS = [("irlfund", "tok-11"), ("clone-of-irlfund", "tok-11")]
