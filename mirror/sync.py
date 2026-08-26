@@ -164,6 +164,19 @@ def read_owner_tokens(environ):
     for o in re.split(r"[,\s]+", environ.get("GITHUB_OWNERS", "").strip()):
         if not o or o.lower() in seen:
             continue  # a repeat is a typo; one token per account either way
+        # GitHub account names are ASCII alphanumerics and hyphens, nothing
+        # else. Rejecting the rest here is not defensive tidiness: token_var()
+        # is implemented twice, once in this file and once in bash in aei, and
+        # the two agree on exactly this character set. `tr` maps bytes and
+        # str.upper() maps Unicode, so a stray non-ASCII character derives two
+        # different variable names - the token would be exported under one and
+        # looked up under the other. Refusing the input keeps the contract
+        # exact instead of nearly exact, and names the real problem.
+        if not re.fullmatch(r"[A-Za-z0-9-]+", o):
+            raise SystemExit(
+                f"GITHUB_OWNERS entry is not a GitHub account name: {o!r} "
+                f"(ASCII letters, digits and hyphens only)"
+            )
         seen.add(o.lower())
         owners.append(o)
 

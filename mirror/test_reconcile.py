@@ -413,6 +413,23 @@ except SystemExit as e:
     check("and the message names the account and the variable",
           "gitcoinco" in str(e) and "GITHUB_INSTALLATION_TOKEN_GITCOINCO" in str(e))
 
+# token_var() exists twice: here, and in bash in aei's launcher. `tr` maps bytes
+# and str.upper() maps Unicode, so they agree on ASCII letters/digits/hyphen and
+# only there - "ß".upper() is "SS" to python and two underscores to tr. Both
+# sides refuse anything outside that set, so the contract is exact rather than
+# nearly exact, and a bad entry is named as a bad entry instead of surfacing as
+# a token that went missing.
+for junk in ("gitcoinß", "org.name", "o/rg", "org_name"):
+    try:
+        sync.read_owner_tokens({"GITHUB_OWNERS": junk})
+        check(f"an account name outside [A-Za-z0-9-] is refused: {junk!r}", False)
+    except SystemExit as e:
+        check(f"an account name outside [A-Za-z0-9-] is refused: {junk!r}",
+              "not a GitHub account name" in str(e))
+check("a hyphen is still allowed",
+      sync.read_owner_tokens({"GITHUB_OWNERS": "my-org",
+                              "GITHUB_INSTALLATION_TOKEN_MY_ORG": "t"}) == [("my-org", "t")])
+
 API_CALLS.clear()
 sync.INSTALL_TOKENS = sync.read_owner_tokens(ENV_2)
 gh = sync.discover_github()
