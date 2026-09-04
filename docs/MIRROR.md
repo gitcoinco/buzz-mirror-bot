@@ -323,23 +323,71 @@ dead `20498bf7…` coordinate — and a protection nobody can distinguish from a
 protection. `GITHUB_OWNERS` naming both accounts is what lets the daemon carry `mirror-bot` like
 anything else.
 
-`.github/workflows/buzz-mirror-main.yml` is **still in this repo** as of this commit. It is
-deleted in a separate PR, after a tick has been seen logging `mirroring mirror-bot ->
-gitcoinco/buzz-mirror-bot`. Deleting it before that would leave no path from Buzz to GitHub at
-all if the enrolment does not take.
+`.github/workflows/buzz-mirror-main.yml` was deleted from this repo on 2026-09-04, on the
+owner's call (lucian), with `GITHUB_OWNERS` already naming `gitcoinco` on infra-box. The plan had
+been to wait for a tick logging `mirroring mirror-bot -> gitcoinco/buzz-mirror-bot`; the merge that
+removed the file is itself that test, because the deletion can only reach GitHub through the
+mirror. If GitHub `main` stops following Buzz `main`, the manual way out below is the only path
+left. The last copy of the workflow is in commit `6333177`.
 
-What was bought was an *automatic* way out of a rare failure. The manual way out is unchanged, and
-it is three commands. Run them on infra-box when the daemon is broken and the fix is on Buzz:
+What was bought was an *automatic* way out of a rare failure. The manual way out is unchanged.
+Run this on infra-box, as root, when the daemon is broken and the fix is on Buzz.
+
+A plain `git clone` of a Buzz remote does not work on that host, so this is longer than it looks
+like it should be. Ubuntu's git is older than 2.46, and below that `git-credential-nostr` silently
+no-ops — no `capability[]=authtype` line, so the relay 401s with a misleading "Everything
+up-to-date" (aei `host/buzz-git-image.sh:8`). Every host script that touches a Buzz remote runs
+the *network* git inside the shared `buzz-git` image for that reason; local reads and commits are
+fine with host git. This copies the shape of aei `host/skills-sync-run-once.sh:41-52`.
 
 ```sh
-git clone https://buzz.gitcoin.co/git/afd48fef…/mirror-bot.git /tmp/fix && cd /tmp/fix
-tok=$(/home/lucian/agentic-engineering-infra/host/gh-app-token.sh --owner gitcoinco)
-git push "https://x-access-token:$tok@github.com/gitcoinco/buzz-mirror-bot.git" HEAD:main
+cd /home/lucian/agentic-engineering-infra/host
+. ./buzz-git-image.sh; IMG=$(ensure_buzz_git_image)   # builds on first use, a few minutes
+set -a; . /etc/buzz-mirror/env; set +a                # BUZZ_PRIVATE_KEY, BUZZ_AUTH_TAG
+export NOSTR_PRIVATE_KEY="$BUZZ_PRIVATE_KEY"          # git-credential-nostr's spelling
+
+mkdir -p /tmp/fix
+docker run --rm -v /tmp/fix:/tmp/fix -e NOSTR_PRIVATE_KEY -e BUZZ_AUTH_TAG "$IMG" \
+    git -c credential.helper=/usr/local/bin/git-credential-nostr -c credential.useHttpPath=true \
+    clone https://buzz.gitcoin.co/git/afd48fef3adfa4f1e794f6ce0b1f640d74c02cbadd0d2c8d0426bc3215c370b4/mirror-bot.git /tmp/fix/mirror-bot
+
+tok=$(./gh-app-token.sh --owner gitcoinco)
+git -C /tmp/fix/mirror-bot push "https://x-access-token:$tok@github.com/gitcoinco/buzz-mirror-bot.git" HEAD:main
 ```
 
-The dispatcher builds from that push and the new image is pinned in aei
-`host/buzz-mirror-image-tag`. Cloning from Buzz needs `NOSTR_PRIVATE_KEY` set to a key that is a
-member of the bound channel.
+The push is host git on purpose: `github.com` needs no credential helper, so only the clone has to
+go through the image. The dispatcher builds from that push, and the new image is pinned in aei
+`host/buzz-mirror-image-tag`.
+
+The owner hex is written out in full rather than elided, because the whole point of a runbook is
+that it can be pasted during an outage.
+
+**It assumes the relay is reachable.** Every command above reads from Buzz. If the relay and the
+mirror are both down there is no path from Buzz to GitHub at all until one of them recovers, and
+nothing here changes that. Deliberately not solved: the fix would be a second copy of the source
+of truth, which is a larger commitment than the failure justifies.
+
+**Partly executed, and here is the line.** The `git clone` was run verbatim against the live relay
+on 2026-08-26 — full owner hex, `credential.helper`, `credential.useHttpPath=true`,
+`NOSTR_PRIVATE_KEY` exported — and it cloned, `HEAD` at `e35d4c5` on `main`. So the URL, the hex,
+the helper flags and the relay's answer are confirmed rather than assembled. It was run from a
+seat with git 2.47.3 and its own key, not from infra-box and not as mirror-bot. `mirror-bot`'s key
+`3f548262…` was in the `ffaf8f45` member list on the same date, checked twice independently, so
+the clone has read access as the runbook would actually run it — a snapshot, not a guarantee.
+
+What is still unproven is the docker wrapper around that clone and the bind mount, on infra-box.
+`IMG=$(ensure_buzz_git_image)` is safe to capture: that function writes build progress to stderr
+and only the tag to stdout (aei `host/buzz-git-image.sh:22`), so a first-run build cannot end up
+inside `$IMG`.
+
+The three failure modes this works around were found by judgebot reviewing the commit that first
+wrote this section, when it was three lines that would each have failed. **If you have infra-box
+access and you have just walked these commands for real, delete the two paragraphs above — from
+"Partly executed" through the `ensure_buzz_git_image` note — in the same commit.** That is the
+only way they go away, and a permanent "unverified" label stops being information.
+
+Leave "It assumes the relay is reachable" where it is. That one is a design decision, not a
+verification status, and walking the runbook does not retire it.
 
 Two things make the deadlock less likely than it was. A broken tick exits non-zero and the unit's
 `OnFailure=` says so, where the Action failed into an email nobody had to act on. And

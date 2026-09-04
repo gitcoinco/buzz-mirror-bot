@@ -7,8 +7,10 @@ GitHub Action that *pulls* from Buzz. Direction is one-way, fast-forward only.
 with the built-in `GITHUB_TOKEN`. The only stored secret is a Buzz *read* key, which grants
 nothing on GitHub — worst case someone reads one channel's repos.
 
-Workflow: [`.github/workflows/buzz-mirror-main.yml`](../.github/workflows/buzz-mirror-main.yml).
-To use it on another repo, copy that file to the same path there and edit the two `env:` values.
+The workflow file was removed from this repo on 2026-09-04; the mirror daemon
+([`MIRROR.md`](MIRROR.md)) carries every enrolled repo, this one included. The last copy is
+`.github/workflows/buzz-mirror-main.yml` in commit `6333177`. To use the Action shape on a repo
+the mirror does not cover, copy that file from there and edit the two `env:` values.
 
 ## One-time setup
 

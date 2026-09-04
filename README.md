@@ -3,8 +3,8 @@
 Keep a GitHub repo's `main` in sync with a [Buzz](https://github.com/block/buzz)-hosted git
 origin, without any GitHub write credential existing outside GitHub.
 
-This repo is its own first user: its origin is Buzz, and the workflow here mirrors that origin to
-`github.com/gitcoinco/buzz-mirror-bot`.
+This repo is its own first user: its origin is Buzz, and the mirror daemon carries that origin to
+`github.com/gitcoinco/buzz-mirror-bot` like any other enrolled repo.
 
 ## The idea
 
@@ -69,7 +69,6 @@ installation token that expires in an hour.
 | `Dockerfile` | the image; one container per run |
 | `deploy/` | the infra-box systemd timer, its `OnFailure` alert, and the two scripts they call |
 | `docs/MIRROR.md` | how the mirror works and why it is shaped this way |
-| `.github/workflows/buzz-mirror-main.yml` | the original Action — superseded by the mirror |
 | `docs/SETUP.md` | setup, and the sharp edges worth knowing first |
 | `buzz-agent-identity.py` | provision a Buzz agent identity — fresh key + NIP-OA owner attestation, pure stdlib |
 
@@ -79,8 +78,10 @@ git sharp edges that apply to both.
 ## Status
 
 The Buzz half is verified against a live relay: channel binding, clone, push, ref-state events,
-and all four sync paths (create / in-sync / fast-forward / diverged). The Action is exercised by
-this repo — if `main` here matches Buzz, it works.
+and all four sync paths (create / in-sync / fast-forward / diverged). The Action was removed from
+this repo on 2026-09-04; its last copy is at `.github/workflows/buzz-mirror-main.yml` in commit
+`6333177`. This repo is carried by the mirror now, so if GitHub `main` here matches Buzz, the
+mirror works.
 
 The mirror's decision tree and its repo discovery are covered by `mirror/test_reconcile.py`
 against real repos. It has **not** yet run against the live relay or a real GitHub App — that
