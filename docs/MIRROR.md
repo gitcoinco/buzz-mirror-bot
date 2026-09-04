@@ -323,10 +323,12 @@ dead `20498bf7…` coordinate — and a protection nobody can distinguish from a
 protection. `GITHUB_OWNERS` naming both accounts is what lets the daemon carry `mirror-bot` like
 anything else.
 
-`.github/workflows/buzz-mirror-main.yml` is **still in this repo** as of this commit. It is
-deleted in a separate PR, after a tick has been seen logging `mirroring mirror-bot ->
-gitcoinco/buzz-mirror-bot`. Deleting it before that would leave no path from Buzz to GitHub at
-all if the enrolment does not take.
+`.github/workflows/buzz-mirror-main.yml` was deleted from this repo on 2026-09-04, on the
+owner's call (lucian), with `GITHUB_OWNERS` already naming `gitcoinco` on infra-box. The plan had
+been to wait for a tick logging `mirroring mirror-bot -> gitcoinco/buzz-mirror-bot`; the merge that
+removed the file is itself that test, because the deletion can only reach GitHub through the
+mirror. If GitHub `main` stops following Buzz `main`, the manual way out below is the only path
+left. The last copy of the workflow is in commit `6333177`.
 
 What was bought was an *automatic* way out of a rare failure. The manual way out is unchanged.
 Run this on infra-box, as root, when the daemon is broken and the fix is on Buzz.
