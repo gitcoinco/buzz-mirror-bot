@@ -209,6 +209,29 @@ for gone, why in (
         raise SystemExit(f"{gone} is gone - {why}.")
 
 
+def read_push_branches(raw):
+    """MIRROR_PUSH_BRANCHES: branch names carried one way, Buzz to GitHub, with
+    force allowed. Comma and/or whitespace separated, like BUZZ_REPO_OWNER.
+
+    This is for branches that get REPLACED rather than extended - a staging
+    branch that each deploy points at a different head. Run through the main
+    path, every such deploy would read as a divergence and halt the pair, main
+    included. `main` itself is refused: its whole contract is that nothing here
+    rewrites it."""
+    names = []
+    for name in (raw or "").replace(",", " ").split():
+        if name in ("main", "refs/heads/main"):
+            raise SystemExit("MIRROR_PUSH_BRANCHES must not name main - main is "
+                             "fast-forward only, in both directions.")
+        if not re.fullmatch(r"[A-Za-z0-9._/-]+", name) or ".." in name or name.startswith("/"):
+            raise SystemExit(f"MIRROR_PUSH_BRANCHES entry is not a branch name: {name!r}")
+        if name not in names:
+            names.append(name)
+    return names
+
+
+PUSH_BRANCHES = read_push_branches(os.environ.get("MIRROR_PUSH_BRANCHES", ""))
+
 def log(msg):
     """Unbuffered stdout - it is the run's journal entry and nothing else."""
     print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}", flush=True)
@@ -910,8 +933,10 @@ def halt(state, repo_id, reason, detail):
     state[repo_id] = {"halted": reason, "since": int(time.time())}
     save_state(state)
     log(f"HALT {repo_id}: {reason} - {detail}")
-    post(f"**Mirror halted: `{repo_id}`** (`{reason}`)\n\n{detail}\n\n"
-         f"Deploys for this repo are frozen until this is resolved.")
+    cost = ("Deploys from this branch are frozen until this is resolved. "
+            "`main` is unaffected." if "@" in repo_id else
+            "Deploys for this repo are frozen until this is resolved.")
+    post(f"**Mirror halted: `{repo_id}`** (`{reason}`)\n\n{detail}\n\n{cost}")
 
 
 def clear_halt(state, repo_id):
@@ -1038,6 +1063,41 @@ def reconcile(buzz_owner, repo_id, gh_repo, token, state):
          f"Neither side can fast-forward to the other; this needs a human.")
 
 
+def push_branch(buzz_owner, repo_id, gh_repo, token, branch, state):
+    """Carry one MIRROR_PUSH_BRANCHES branch from Buzz to GitHub.
+
+    One way only: GitHub's copy is never read back, so a commit made there is
+    overwritten on the next carry. Force is allowed because the branch is
+    replaced, not extended. A branch Buzz does not have is left alone on GitHub
+    (absent on Buzz is the normal state for most repos). Halts are kept under
+    their own key, `<repo>@<branch>`, so a failure here never touches main's
+    halt state and main keeps mirroring."""
+    key = f"{repo_id}@{branch}"
+    ref = f"refs/heads/{branch}"
+    d = ensure_repo(repo_id)
+    try:
+        buzz = buzz_url(buzz_owner, repo_id)
+        heads = [line.split("\t", 1)[1] for line in
+                 git(d, "ls-remote", "--heads", buzz).splitlines() if "\t" in line]
+        if ref not in heads:
+            clear_halt(state, key)
+            return True
+        git(d, "fetch", "-q", "--no-tags", buzz, f"+{ref}:refs/remotes/buzz/{branch}")
+        buzz_tip = git(d, "rev-parse", f"refs/remotes/buzz/{branch}")
+        gh = github_url(gh_repo, token)
+        gh_tip = next((line.split("\t", 1)[0] for line in
+                       git(d, "ls-remote", "--heads", gh, ref).splitlines()
+                       if line.endswith(f"\t{ref}")), None)
+        if gh_tip != buzz_tip:
+            git(d, "push", "--force", gh, f"{buzz_tip}:{ref}")
+            log(f"{key}: {(gh_tip or 'none')[:7]} -> {buzz_tip[:7]} (one-way, forced)")
+        clear_halt(state, key)
+    except Exception as e:  # noqa: BLE001 - one branch must not stop the tick
+        halt(state, key, "push-branch-failed", f"```\n{str(e)[:800]}\n```")
+        return False
+    return True
+
+
 def tick():
     state = load_state()
     # Discovery re-runs every tick rather than being cached: installation tokens
@@ -1089,6 +1149,12 @@ def tick():
                 elif reason.startswith("github-"):
                     detail += GITHUB_404
             halt(state, repo_id, reason, detail)
+            # The same outage would fail every push branch too and post once
+            # per branch. main's halt already says it; try again next tick.
+            continue
+        for branch in PUSH_BRANCHES:
+            if push_branch(buzz_owner, repo_id, gh_repo, token, branch, state) is False:
+                ok = False
     if ok:
         touch_last_success()
     return ok
