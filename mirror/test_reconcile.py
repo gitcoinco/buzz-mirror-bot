@@ -41,6 +41,8 @@ sync.open_pr = lambda *a, **k: "buzz://pr/test"
 # nothing. This bit me once already.
 REAL_BUZZ_CLI = sync.buzz_cli
 REAL_API = sync.api
+REAL_RECONCILE = sync.reconcile
+REAL_LOAD_STATE, REAL_SAVE_STATE = sync.load_state, sync.save_state
 
 BUZZ = os.path.join(TMP, "buzz.git")
 GITHUB = os.path.join(TMP, "github.git")
@@ -1118,6 +1120,48 @@ check("main's halt state is untouched", st["r"] == {})
 sync.github_url = real_github_url
 sync.push_branch(OWNER1, "r", "o/r", "tok", "staging", st)
 check("the next good carry clears it", st.get("r@staging") == {})
+
+# Through tick(): a failing carry fails the run but main still mirrors, and a
+# second failing tick does not post again. An outage that fails main skips the
+# branches for that tick instead of posting once per branch.
+real_reconcile, real_discover = REAL_RECONCILE, sync.discover
+sync.reconcile = real_reconcile
+sync.PUSH_BRANCHES = ["staging"]
+sync.discover = lambda: ([("r", OWNER1, "o/r", "tok")], True)
+# The lock/exit tests above stub state out; halts are sticky only through it.
+sync.load_state, sync.save_state = REAL_LOAD_STATE, REAL_SAVE_STATE
+work, base = scenario("tick: staging carry fails, main still mirrors")
+new_main = commit(work, "main work")
+sh("git", "push", "-q", BUZZ, "main:main", "HEAD:refs/heads/staging", cwd=work)
+real_push_branch = sync.push_branch
+def broken_github_for_branch(*a, **k):
+    saved = sync.github_url
+    sync.github_url = lambda gh_repo, token: os.path.join(TMP, "missing.git")
+    try:
+        return real_push_branch(*a, **k)
+    finally:
+        sync.github_url = saved
+sync.push_branch = broken_github_for_branch
+check("a failing carry fails the tick", sync.tick() is False)
+check("main mirrored in the same tick", tip(GITHUB) == new_main)
+check("one halt posted, for r@staging",
+      len(POSTS) == 1 and "r@staging" in POSTS[0] and "`main` is unaffected" in POSTS[0])
+sync.tick()
+check("a second failing tick posts nothing new", len(POSTS) == 1)
+sync.push_branch = real_push_branch
+
+calls = []
+sync.push_branch = lambda *a, **k: calls.append(a) or True
+def main_outage(*a, **k):
+    raise RuntimeError("git failed (128): unable to access 'https://github.com/o/r.git/': "
+                       "The requested URL returned error: 502")
+sync.reconcile = main_outage
+work, base = scenario("tick: main outage skips the branches")
+os.makedirs(os.path.join(TMP, "state"), exist_ok=True)
+sync.tick()
+check("no branch carry while main is failing", calls == [])
+sync.push_branch, sync.reconcile, sync.discover = real_push_branch, real_reconcile, real_discover
+sync.PUSH_BRANCHES = []
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nFAILED" if FAILED else "\nall passed")

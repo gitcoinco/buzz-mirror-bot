@@ -933,8 +933,10 @@ def halt(state, repo_id, reason, detail):
     state[repo_id] = {"halted": reason, "since": int(time.time())}
     save_state(state)
     log(f"HALT {repo_id}: {reason} - {detail}")
-    post(f"**Mirror halted: `{repo_id}`** (`{reason}`)\n\n{detail}\n\n"
-         f"Deploys for this repo are frozen until this is resolved.")
+    cost = ("Deploys from this branch are frozen until this is resolved. "
+            "`main` is unaffected." if "@" in repo_id else
+            "Deploys for this repo are frozen until this is resolved.")
+    post(f"**Mirror halted: `{repo_id}`** (`{reason}`)\n\n{detail}\n\n{cost}")
 
 
 def clear_halt(state, repo_id):
@@ -1147,6 +1149,9 @@ def tick():
                 elif reason.startswith("github-"):
                     detail += GITHUB_404
             halt(state, repo_id, reason, detail)
+            # The same outage would fail every push branch too and post once
+            # per branch. main's halt already says it; try again next tick.
+            continue
         for branch in PUSH_BRANCHES:
             if push_branch(buzz_owner, repo_id, gh_repo, token, branch, state) is False:
                 ok = False
