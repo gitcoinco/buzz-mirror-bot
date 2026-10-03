@@ -1063,6 +1063,62 @@ check("an overlapping run did no work", touched == [])
 held.close()
 check("the lock is released when the holder exits", sync.hold_lock() is not None)
 
+# MIRROR_PUSH_BRANCHES: one way, Buzz to GitHub, force allowed, never main.
+def branch_tip(repo, branch):
+    return subprocess.run(["git", "-C", repo, "rev-parse", "-q", "--verify",
+                           f"refs/heads/{branch}"], capture_output=True, text=True).stdout.strip()
+
+
+check("push branches parse commas and spaces, dropping repeats",
+      sync.read_push_branches(" staging, preview staging ") == ["staging", "preview"])
+check("an empty setting carries nothing", sync.read_push_branches("") == [])
+for bad in ("main", "refs/heads/main", "a..b", "x y;rm"):
+    try:
+        sync.read_push_branches(bad)
+        check(f"push branches refuse {bad!r}", False)
+    except SystemExit:
+        check(f"push branches refuse {bad!r}", True)
+
+work, base = scenario("push branch: absent on buzz")
+st = {}
+check("absent branch is not an error", sync.push_branch(OWNER1, "r", "o/r", "tok", "staging", st))
+check("absent branch is not created on github", branch_tip(GITHUB, "staging") == "")
+
+work, base = scenario("push branch: created, then replaced by an unrelated head")
+first = commit(work, "deploy one")
+sh("git", "push", "-q", BUZZ, "HEAD:refs/heads/staging", cwd=work)
+st = {}
+sync.push_branch(OWNER1, "r", "o/r", "tok", "staging", st)
+check("github staging created at buzz's tip", branch_tip(GITHUB, "staging") == first)
+sh("git", "reset", "-q", "--hard", base, cwd=work)
+other = commit(work, "deploy two, not a descendant")
+sh("git", "push", "-q", "--force", BUZZ, "HEAD:refs/heads/staging", cwd=work)
+sync.push_branch(OWNER1, "r", "o/r", "tok", "staging", st)
+check("a non-fast-forward replacement is force-carried", branch_tip(GITHUB, "staging") == other)
+check("main is untouched by a branch carry", tip(GITHUB) == base)
+check("a carry posts nothing", POSTS == [])
+
+work, base = scenario("push branch: github-side commits are overwritten")
+sh("git", "push", "-q", BUZZ, "HEAD:refs/heads/staging", cwd=work)
+gh_only = commit(work, "made on github")
+sh("git", "push", "-q", GITHUB, "HEAD:refs/heads/staging", cwd=work)
+sync.push_branch(OWNER1, "r", "o/r", "tok", "staging", {})
+check("buzz wins: github's staging is reset to buzz's", branch_tip(GITHUB, "staging") == base)
+check("buzz's staging never adopts github's", branch_tip(BUZZ, "staging") == base)
+
+# A failing branch carry halts under its own key and leaves main's state alone.
+work, base = scenario("push branch: failure is isolated from main")
+sh("git", "push", "-q", BUZZ, "HEAD:refs/heads/staging", cwd=work)
+real_github_url = sync.github_url
+sync.github_url = lambda gh_repo, token: os.path.join(TMP, "missing.git")
+st = {"r": {}}
+check("a failed carry reports failure", sync.push_branch(OWNER1, "r", "o/r", "tok", "staging", st) is False)
+check("it halts as r@staging", st.get("r@staging", {}).get("halted") == "push-branch-failed")
+check("main's halt state is untouched", st["r"] == {})
+sync.github_url = real_github_url
+sync.push_branch(OWNER1, "r", "o/r", "tok", "staging", st)
+check("the next good carry clears it", st.get("r@staging") == {})
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nFAILED" if FAILED else "\nall passed")
 sys.exit(1 if FAILED else 0)

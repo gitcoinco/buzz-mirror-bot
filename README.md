@@ -50,9 +50,11 @@ installation token that expires in an hour.
   fast-forward Buzz to GitHub's tip when GitHub is strictly ahead, because that is an update
   rather than a conflict; see [`docs/MIRROR.md`](docs/MIRROR.md) for what that costs. The Action
   is one-way and stays that way.
-- **Fast-forward only.** Every push is plain and non-force, so nothing here can rewrite history
+- **Fast-forward only on `main`.** Every `main` push is plain and non-force, so nothing here can rewrite `main`
   in either direction. If the two `main`s genuinely diverge, it halts and asks a human.
-- **`main` only.** Other branches stay on Buzz.
+- **`main` only, plus named push branches.** Other branches stay on Buzz. Branches listed in
+  `MIRROR_PUSH_BRANCHES` (e.g. a `staging` that each deploy replaces) are pushed one way, Buzz to
+  GitHub, with force; see [`docs/MIRROR.md`](docs/MIRROR.md).
 - **Least-privilege identity.** `mirror-bot` is a distinct nostr key added to the repo's bound
   channel as a `bot`, carrying a NIP-OA attestation from its owner. Buzz-side branch protection
   is what bounds it: `push:member` lets it fast-forward `main` and nothing else, and the relay's

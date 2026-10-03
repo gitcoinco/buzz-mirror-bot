@@ -28,6 +28,20 @@ Per repo, per run, it fetches both `main`s into a bare clone and compares them:
 Every push is plain and non-force. Nothing here can rewrite history on either side; the worst
 outcome is that a repo stops mirroring and says so.
 
+### Push branches: one way, force allowed
+
+`main` is the only branch the table above applies to. Branches named in `MIRROR_PUSH_BRANCHES`
+(default empty; aei's `run-once.sh` sets `staging`) get a different, smaller contract: Buzz's tip
+is pushed to GitHub with `--force` whenever the two differ, in every mirrored repo whose Buzz side
+has the branch. GitHub's copy is never read back, so a commit made there is overwritten on the
+next run. A repo without the branch on Buzz is skipped, and an existing GitHub branch is left as
+it is.
+
+These are branches that get replaced rather than extended. regenOS's `staging` points at whatever
+head was deployed last, and the deploy webhook fires from GitHub. Under the `main` rules every
+such deploy would be a divergence, and the halt would stop `main` too. A failure here halts under
+its own key, `<repo>@<branch>`, so `main` keeps mirroring. `main` itself cannot be listed.
+
 ### GitHub ahead is an update, not an error
 
 A strict ancestor is a fast-forward in either direction, and adopting one needs no judgement.
@@ -407,6 +421,7 @@ direction it cannot push — GitHub ahead of Buzz — it opens a PR rather than 
 | `MIRROR_ALERT_CHANNEL` | channel UUID for halt, recovery and adoption messages |
 | `GH_APP_TOKEN_CMD` | *optional.* Issuer path. Default `/usr/local/bin/gh-app-token` |
 | `MIRROR_INTERVAL_SECS` | loop mode only; ignored by `--once`. Default 60 |
+| `MIRROR_PUSH_BRANCHES` | *optional.* Branch names carried one way, Buzz to GitHub, force allowed; see [push branches](#push-branches-one-way-force-allowed). Commas or whitespace. `main` is refused |
 
 **No GitHub credential appears here.** `run-once.sh` mints one token per named account per run and
 passes each with `-e GITHUB_INSTALLATION_TOKEN_<OWNER>` — no value on the command line, so none of
